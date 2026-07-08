@@ -124,9 +124,9 @@ class AudioTranscriptionService:
         return filename
 
     def _transcribe_audio_bytes(self, audio_bytes: bytes, filename: str) -> str:
-        api_key = os.getenv("OPENAI_API_KEY1")
+        api_key = os.getenv("OPENAI_API_KEY_1")
         if not api_key:
-            raise AudioTranscriptionError("OPENAI_API_KEY1 no configurada para transcribir audio.")
+            raise AudioTranscriptionError("OPENAI_API_KEY_1 no configurada para transcribir audio.")
 
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = filename
