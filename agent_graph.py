@@ -291,6 +291,7 @@ def create_graph(checkpointer: BaseCheckpointSaver):
     # Modelo de lenguaje principal (GPT-4o mini) con reintentos para rate limit
     llm = ChatOpenAI(
         model="gpt-4o-mini",
+        api_key=os.getenv("OPENAI_API_KEY1"),
         temperature=0.1,
         max_retries=5
     ).bind_tools([procesar_oportunidad_backend])
