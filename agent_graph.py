@@ -201,6 +201,14 @@ def procesar_oportunidad_backend(
     numero_whatsapp: str,
     resumen_18_palabras: str
 ) -> str:
+    """
+    Registra una oportunidad comercial calificada y notifica al equipo de AISA.
+
+    Recibe los datos del cliente, ubicacion, consumo, distribuidora, necesidad,
+    equipos propuestos, WhatsApp y resumen ejecutivo. Normaliza el contacto,
+    dispara notificaciones por correo/webhook en segundo plano y devuelve una
+    confirmacion textual para el agente.
+    """
     nombre_norm, whatsapp_norm = normalizar_contacto(nombre_apellidos, numero_whatsapp, departamento_municipio)
 
     def tarea_background():
