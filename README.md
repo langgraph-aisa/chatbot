@@ -235,6 +235,9 @@ flowchart TD
 |---|---|
 | `CHATBOT_MASTER_API_KEY` | Autenticación |
 | `OPENAI_API_KEY` | LLM |
+| `OPENAI_TRANSCRIPTION_MODEL` | Modelo STT opcional (`gpt-4o-mini-transcribe` por defecto) |
+| `OPENAI_TRANSCRIPTION_LANGUAGE` | Idioma STT opcional (`es` por defecto) |
+| `MAX_N8N_AUDIO_BYTES` | Limite opcional de audio n8n en bytes |
 | `DATABASE_URL` | PostgreSQL |
 | `LANGCHAIN_API_KEY` | LangSmith |
 | `LANGCHAIN_PROJECT` | Proyecto |

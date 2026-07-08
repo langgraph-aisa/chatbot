@@ -524,10 +524,3 @@ def create_graph(checkpointer: BaseCheckpointSaver):
 
     return graph_builder.compile(checkpointer=checkpointer)
 
-# ---------------------------------------------------------------------------
-# Exportación para LangGraph Studio
-# ---------------------------------------------------------------------------
-from langgraph.checkpoint.memory import MemorySaver
-
-checkpointer_studio = MemorySaver()
-jarvi_graph = create_graph(checkpointer_studio)

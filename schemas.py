@@ -42,9 +42,14 @@ class ChatRequest(BaseModel):
                     "estado conversacional y la persistencia en PostgreSQL."
     )
     message: str = Field(
-        ...,
+        default="",
         description="Contenido del mensaje del cliente. Puede ser texto "
                     "plano, pregunta técnica o descripción de necesidad."
+    )
+    url_n8n_audio: str = Field(
+        default="",
+        description="URL temporal enviada por n8n cuando el mensaje llega como audio. "
+                    "Si viene vacia, se usa el campo message directamente."
     )
     metadata: Optional[Dict[str, Any]] = Field(
         default_factory=dict,

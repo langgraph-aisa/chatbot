@@ -5,38 +5,25 @@ Se conservan todos los middlewares, autenticación, telemetría y logs.
 """
 
 import os
-import asyncio
-import json
 import time
 import logging
-from collections import defaultdict
-from typing import AsyncGenerator
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import psutil
 from fastapi import FastAPI, HTTPException, Depends, Security, Request
-from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from contextlib import asynccontextmanager, AsyncExitStack
-from pydantic import BaseModel
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langchain_core.messages import HumanMessage, AIMessage
 
-from schemas import ChatRequest, ChatResponse, AudioRequest, ImageRequest
 from agent_graph import create_graph
-from config import ISOConfigValidator
+from routes.auxiliary import router as auxiliary_router
+from routes.chat import router as chat_router
+from services.chat_service import ChatService
 from telemetry import (
     trace_id_var, span_id_var, parent_span_id_var,
     generate_trace_span, log_telemetry_event, start_batch_worker
 )
-
-# ---------------------------------------------------------------------------
-# Esquemas adicionales de validación de datos (Pydantic)
-# ---------------------------------------------------------------------------
-class TTSRequest(BaseModel):
-    text: str
-    voice: str | None = None
 
 # ---------------------------------------------------------------------------
 # Configuración de logging
@@ -55,11 +42,6 @@ async def validar_api_key(auth: str | None = Security(api_key_header)):
     if not auth or auth != f"Bearer {API_KEY}":
         raise HTTPException(status_code=403, detail="Acceso no autorizado")
     return auth
-
-# ---------------------------------------------------------------------------
-# Control de concurrencia
-# ---------------------------------------------------------------------------
-locks = defaultdict(asyncio.Lock)
 
 # ---------------------------------------------------------------------------
 # Taxonomía de errores
@@ -98,6 +80,8 @@ async def lifespan(app: FastAPI):
         checkpointer = await stack.enter_async_context(raw_checkpointer)
         await checkpointer.setup()
         graph = create_graph(checkpointer)
+        app.state.graph = graph
+        app.state.chat_service = ChatService(graph)
         logger.info("JARVI 2.0 API inicializada – Grafo listo")
         start_batch_worker()
         logger.info("CTFOM: worker de telemetría iniciado")
@@ -106,6 +90,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="JARVI 2.0 API Central", version="2.0.03",
               lifespan=lifespan, dependencies=[Depends(validar_api_key)])
+
+app.include_router(chat_router)
+app.include_router(auxiliary_router)
 
 # ---------------------------------------------------------------------------
 # Middleware de telemetría
@@ -137,84 +124,3 @@ async def telemetry_middleware(request: Request, call_next):
         )
         raise
 
-# ---------------------------------------------------------------------------
-# Endpoint ACK
-# ---------------------------------------------------------------------------
-@app.post("/ack/{trace_id}")
-async def acknowledge_dispatch(trace_id: str):
-    return {"status": "ACK received", "trace_id": trace_id}
-
-# ---------------------------------------------------------------------------
-# Función de generación de tokens (con checkpointing garantizado y sin delays)
-# ---------------------------------------------------------------------------
-async def generar_tokens(thread_id: str, mensaje: str) -> AsyncGenerator[str, None]:
-    # Inyectar trace_id en el config para que esté disponible en el grafo
-    trace_id = trace_id_var.get()
-    config = {"configurable": {"thread_id": thread_id}}
-    config["metadata"] = config.get("metadata", {})
-    config["metadata"]["trace_id"] = trace_id
-
-    estado_inicial = {"messages": [HumanMessage(content=mensaje)]}
-    logger.info(f"Ejecutando chat para thread_id={thread_id}, trace_id={trace_id}")
-
-    async with locks[thread_id]:
-        # 1. Invocar el grafo (ainvoke garantiza checkpoint)
-        resultado = await graph.ainvoke(estado_inicial, config=config)
-        messages = resultado.get("messages", [])
-        ctx = resultado.get("contexto_tecnico", {})
-
-        logger.info(f"Contexto final para thread {thread_id}: {ctx}")
-
-        # 2. Extraer la última respuesta del asistente
-        respuesta_final = ""
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage):
-                respuesta_final = msg.content
-                break
-
-        # 3. Simular streaming de tokens (sin sleeps, rápido)
-        if respuesta_final:
-            tokens = respuesta_final.split()
-            for i, token in enumerate(tokens):
-                sep = " " if i < len(tokens)-1 else ""
-                yield f"data: {json.dumps({'token': token + sep})}\n\n"
-        else:
-            yield f"data: {json.dumps({'token': 'No se pudo generar una respuesta. Por favor, intenta de nuevo.'})}\n\n"
-
-        # Enviar contexto al final
-        yield f"data: {json.dumps({'contexto_tecnico': ctx})}\n\n"
-
-# ---------------------------------------------------------------------------
-# Endpoint principal /chat
-# ---------------------------------------------------------------------------
-@app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
-    return StreamingResponse(
-        generar_tokens(request.thread_id, request.message),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-            "Access-Control-Allow-Origin": "*"
-        }
-    )
-
-# ---------------------------------------------------------------------------
-# Endpoints auxiliares (aún no implementados)
-# ---------------------------------------------------------------------------
-@app.post("/stt")
-async def speech_to_text(request: AudioRequest):
-    raise HTTPException(status_code=501, detail="No implementado – pendiente centralizar Whisper")
-
-@app.post("/tts")
-async def text_to_speech(request: TTSRequest):
-    raise HTTPException(status_code=501, detail="No implementado – pendiente centralizar TTS")
-
-@app.post("/vision/analyze")
-async def analizar_factura(request: ImageRequest):
-    raise HTTPException(status_code=501, detail="No implementado – pendiente centralizar visión")
-
-@app.post("/products")
-async def consultar_productos(topologia: str = "on-grid"):
-    raise HTTPException(status_code=501, detail="No implementado – pendiente exponer catálogo")
