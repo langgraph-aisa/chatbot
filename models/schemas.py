@@ -51,6 +51,21 @@ class ChatRequest(BaseModel):
         description="URL temporal enviada por n8n cuando el mensaje llega como audio. "
                     "Si viene vacia, se usa el campo message directamente."
     )
+    name: str = Field(
+        default="",
+        description="Nombre del usuario o cliente que envía el mensaje. "
+                    "Opcional, pero útil para personalizar la respuesta."
+    )
+    phone: str = Field(
+        default="",
+        description="Número de teléfono del cliente. Opcional, pero útil "
+                    "para canales que requieren contacto directo."
+    )
+    record: str = Field(
+        default="",
+        description="Historial de la conversación en formato JSON. Se utiliza para "
+                    "mantener el contexto de la conversación."
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         default_factory=dict,
         description="Metadatos adicionales inyectados por el canal "

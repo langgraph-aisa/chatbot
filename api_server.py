@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langchain_core.messages import HumanMessage
 
-from schemas import ChatRequest
+from models.schemas import ChatRequest
 from agent_graph import create_graph
 from telemetry import (
     trace_id_var, span_id_var, parent_span_id_var,

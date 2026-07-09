@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
-from schemas import AudioRequest, ImageRequest, TTSRequest
+from models.schemas import AudioRequest, ImageRequest, TTSRequest
 
 
 router = APIRouter()

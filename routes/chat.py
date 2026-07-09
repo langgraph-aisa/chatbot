@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from schemas import ChatRequest
+from models.schemas import ChatRequest
 from services.audio_service import AudioTranscriptionError
 from services.chat_service import ChatService
 
@@ -31,6 +31,10 @@ async def chat_endpoint(
 
     if not message:
         raise HTTPException(status_code=400, detail="message vacio y url_n8n_audio vacio")
+
+    print(f"Nombre del campo recibido: {payload.name} tipo: {type(payload.name)}")
+    print(f"Teléfono del campo recibido: {payload.phone} tipo: {type(payload.phone)}")
+    print(f"Historial del campo recibido: {payload.record} tipo: {type(payload.record)}")
 
     return StreamingResponse(
         chat_service.generar_tokens(payload.thread_id, message),
