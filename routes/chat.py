@@ -50,15 +50,15 @@ async def chat_endpoint(
     thread_id = (payload.thread_id or payload.phone or payload.name or "n8n-default-thread").strip()
 
     logger.info(
-        "Payload /chat normalizado: thread_id=%s, name=%s, phone=%s, record_type=%s",
+        "Payload /chat normalizado: thread_id=%s, name=%s, phone=%s, record_items=%s",
         thread_id,
         payload.name,
         payload.phone,
-        type(payload.record).__name__,
+        len(payload.record),
     )
 
     return StreamingResponse(
-        chat_service.generar_tokens(thread_id, message),
+        chat_service.generar_tokens(thread_id, message, payload.record),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -20,7 +20,7 @@ Estándares aplicados:
 
 import json
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Dict, Any, Optional
 
 
@@ -38,41 +38,33 @@ class ChatRequest(BaseModel):
         5. Incluir `metadata` con campos adicionales (ej. `"source": "n8n"`)
            → debe ser aceptado sin errores.
     """
-    model_config = ConfigDict(populate_by_name=True)
-
     thread_id: str = Field(
         default="",
-        validation_alias=AliasChoices("thread_id", "session_id", "sessionId", "chat_id", "chatId"),
         description="ID único de sesión del cliente. Permite mantener el "
                     "estado conversacional y la persistencia en PostgreSQL."
     )
     message: str = Field(
         default="",
-        validation_alias=AliasChoices("message", "text", "mensaje", "body", "query", "input", "content"),
         description="Contenido del mensaje del cliente. Puede ser texto "
                     "plano, pregunta técnica o descripción de necesidad."
     )
     url_n8n_audio: str = Field(
         default="",
-        validation_alias=AliasChoices("url_n8n_audio", "audio_url", "audioUrl", "url_audio", "audio", "voice_url"),
         description="URL temporal enviada por n8n cuando el mensaje llega como audio. "
                     "Si viene vacia, se usa el campo message directamente."
     )
     name: str = Field(
         default="",
-        validation_alias=AliasChoices("name", "nombre", "pushName", "contact_name", "contactName"),
         description="Nombre del usuario o cliente que envía el mensaje. "
                     "Opcional, pero útil para personalizar la respuesta."
     )
     phone: str = Field(
         default="",
-        validation_alias=AliasChoices("phone", "telefono", "teléfono", "whatsapp", "from", "sender", "phone_number", "phoneNumber"),
         description="Número de teléfono del cliente. Opcional, pero útil "
                     "para canales que requieren contacto directo."
     )
-    record: list = Field(
-        default="",
-        validation_alias=AliasChoices("record", "history", "historial", "conversation", "messages"),
+    record: list[dict[str, Any]] = Field(
+        default_factory=list,
         description="Historial de la conversación en formato JSON. Se utiliza para "
                     "mantener el contexto de la conversación."
     )
@@ -83,6 +75,34 @@ class ChatRequest(BaseModel):
                     "trazabilidad (LangSmith, auditoría)."
     )
 
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalizar_aliases_n8n(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        alias_groups = {
+            "thread_id": ("session_id", "sessionId", "chat_id", "chatId"),
+            "message": ("text", "mensaje", "body", "query", "input", "content"),
+            "url_n8n_audio": ("audio_url", "audioUrl", "url_audio", "audio", "voice_url"),
+            "name": ("nombre", "pushName", "contact_name", "contactName"),
+            "phone": ("telefono", "teléfono", "whatsapp", "from", "sender", "phone_number", "phoneNumber"),
+            "record": ("history", "historial", "conversation", "messages"),
+        }
+
+        for target, aliases in alias_groups.items():
+            current = normalized.get(target)
+            if current not in (None, ""):
+                continue
+            for alias in aliases:
+                value = normalized.get(alias)
+                if value not in (None, ""):
+                    normalized[target] = value
+                    break
+
+        return normalized
 
     @field_validator("url_n8n_audio", mode="before")
     @classmethod
@@ -99,7 +119,35 @@ class ChatRequest(BaseModel):
                         return first[key]
         return value
 
-    @field_validator("thread_id", "message", "url_n8n_audio", "name", "phone", "record", mode="before")
+    @field_validator("record", mode="before")
+    @classmethod
+    def normalizar_record(cls, value):
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            for key in ("messages", "record", "history", "historial", "conversation"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    return [item for item in nested if isinstance(item, dict)]
+            return [value]
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return []
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+            if isinstance(parsed, dict):
+                for key in ("messages", "record", "history", "historial", "conversation"):
+                    nested = parsed.get(key)
+                    if isinstance(nested, list):
+                        return [item for item in nested if isinstance(item, dict)]
+                return [parsed]
+        return []
+
+    @field_validator("thread_id", "message", "url_n8n_audio", "name", "phone", mode="before")
     @classmethod
     def normalizar_campos_texto(cls, value, info):
         if value is None:

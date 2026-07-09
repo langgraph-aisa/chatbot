@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import json
 import logging
+import os
 from collections import defaultdict
 from typing import Any, AsyncGenerator
 
@@ -11,6 +13,7 @@ from telemetry import trace_id_var
 
 
 logger = logging.getLogger("jarvi.api")
+MAX_RECORD_MESSAGES = int(os.getenv("MAX_N8N_RECORD_MESSAGES", "20"))
 
 
 class ChatService:
@@ -28,17 +31,95 @@ class ChatService:
 
         return (mensaje or "").strip()
 
-    async def generar_tokens(self, thread_id: str, mensaje: str) -> AsyncGenerator[str, None]:
+    def _record_to_messages(self, thread_id: str, record: list[dict[str, Any]] | None, mensaje: str) -> list:
+        if not record:
+            return []
+
+        messages = []
+        for index, item in enumerate(record[-MAX_RECORD_MESSAGES:]):
+            role = str(
+                item.get("role")
+                or item.get("type")
+                or item.get("sender_type")
+                or item.get("sender")
+                or ""
+            ).lower()
+            content = (
+                item.get("content")
+                or item.get("text")
+                or item.get("message")
+                or item.get("body")
+                or item.get("value")
+                or ""
+            )
+
+            if isinstance(content, (dict, list)):
+                content = json.dumps(content, ensure_ascii=False)
+            content = str(content).strip()
+            if not content:
+                continue
+
+            if item.get("fromMe") is True:
+                role = "assistant"
+            elif item.get("fromMe") is False and not role:
+                role = "user"
+
+            digest = hashlib.sha1(f"{role}:{content}".encode("utf-8")).hexdigest()[:16]
+            message_id = f"n8n-record-{thread_id}-{index}-{digest}"
+
+            if role in {"assistant", "ai", "bot", "jarvi"}:
+                messages.append(AIMessage(content=content, id=message_id))
+            elif role in {"user", "human", "cliente", "customer", "contact"}:
+                messages.append(HumanMessage(content=content, id=message_id))
+
+        if messages and isinstance(messages[-1], HumanMessage) and messages[-1].content.strip() == mensaje.strip():
+            messages.pop()
+
+        return messages
+
+    async def _checkpoint_tiene_historial(self, config: dict) -> bool:
+        aget_state = getattr(self.graph, "aget_state", None)
+        if not aget_state:
+            return False
+
+        try:
+            snapshot = await aget_state(config)
+        except Exception as exc:
+            logger.warning("No se pudo inspeccionar checkpoint antes de aplicar record: %s", exc)
+            return False
+
+        values = getattr(snapshot, "values", None) or {}
+        return bool(values.get("messages"))
+
+    async def generar_tokens(
+        self,
+        thread_id: str,
+        mensaje: str,
+        record: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[str, None]:
         trace_id = trace_id_var.get()
         config = {"configurable": {"thread_id": thread_id}, "metadata": {"trace_id": trace_id}}
-        estado_inicial = {
-            "messages": [HumanMessage(content=mensaje)],
-            "contexto_tecnico": {},
-        }
-
-        logger.info("Ejecutando chat para thread_id=%s, trace_id=%s", thread_id, trace_id)
 
         async with self.locks[thread_id]:
+            record_messages = []
+            if record:
+                if await self._checkpoint_tiene_historial(config):
+                    logger.info("Record externo omitido: LangGraph ya tiene historial para thread_id=%s", thread_id)
+                else:
+                    record_messages = self._record_to_messages(thread_id, record, mensaje)
+
+            estado_inicial = {
+                "messages": [*record_messages, HumanMessage(content=mensaje)],
+                "contexto_tecnico": {},
+            }
+
+            logger.info(
+                "Ejecutando chat para thread_id=%s, trace_id=%s, record_messages=%s",
+                thread_id,
+                trace_id,
+                len(record_messages),
+            )
+
             resultado = await self.graph.ainvoke(estado_inicial, config=config)
             messages = resultado.get("messages", [])
             ctx = resultado.get("contexto_tecnico", {})
