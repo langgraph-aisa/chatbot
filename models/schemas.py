@@ -18,7 +18,9 @@ Estándares aplicados:
   Las pruebas sugeridas se incluyen en cada clase.
 """
 
-from pydantic import BaseModel, Field
+import json
+
+from pydantic import BaseModel, Field, field_validator
 from typing import Dict, Any, Optional
 
 
@@ -37,7 +39,7 @@ class ChatRequest(BaseModel):
            → debe ser aceptado sin errores.
     """
     thread_id: str = Field(
-        ...,
+        default="",
         description="ID único de sesión del cliente. Permite mantener el "
                     "estado conversacional y la persistencia en PostgreSQL."
     )
@@ -72,6 +74,18 @@ class ChatRequest(BaseModel):
                     "(fuente, tags, etc.) que se propagan al sistema de "
                     "trazabilidad (LangSmith, auditoría)."
     )
+
+
+    @field_validator("thread_id", "message", "url_n8n_audio", "name", "phone", "record", mode="before")
+    @classmethod
+    def normalizar_campos_texto(cls, value):
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
 
 
 class ChatResponse(BaseModel):

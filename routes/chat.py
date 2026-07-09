@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
@@ -7,6 +9,7 @@ from services.chat_service import ChatService
 
 
 router = APIRouter()
+logger = logging.getLogger("jarvi.api")
 
 
 def get_chat_service(request: Request) -> ChatService:
@@ -32,12 +35,20 @@ async def chat_endpoint(
     if not message:
         raise HTTPException(status_code=400, detail="message vacio y url_n8n_audio vacio")
 
-    print(f"Nombre del campo recibido: {payload.name} tipo: {type(payload.name)}")
-    print(f"Teléfono del campo recibido: {payload.phone} tipo: {type(payload.phone)}")
-    print(f"Historial del campo recibido: {payload.record} tipo: {type(payload.record)}")
+    thread_id = (payload.thread_id or payload.phone or payload.name).strip()
+    if not thread_id:
+        raise HTTPException(status_code=400, detail="thread_id o phone requerido")
+
+    logger.info(
+        "Payload /chat normalizado: thread_id=%s, name=%s, phone=%s, record_type=%s",
+        thread_id,
+        payload.name,
+        payload.phone,
+        type(payload.record).__name__,
+    )
 
     return StreamingResponse(
-        chat_service.generar_tokens(payload.thread_id, message),
+        chat_service.generar_tokens(thread_id, message),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
