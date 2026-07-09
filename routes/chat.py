@@ -33,11 +33,21 @@ async def chat_endpoint(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     if not message:
-        raise HTTPException(status_code=400, detail="message vacio y url_n8n_audio vacio")
+        logger.warning(
+            "Payload /chat rechazado sin contenido: has_message=%s, has_audio_url=%s, has_phone=%s",
+            bool(payload.message),
+            bool(payload.url_n8n_audio),
+            bool(payload.phone),
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "sin_contenido",
+                "message": "Enviar message/text/body con texto o url_n8n_audio/audio_url con una URL de audio.",
+            },
+        )
 
-    thread_id = (payload.thread_id or payload.phone or payload.name).strip()
-    if not thread_id:
-        raise HTTPException(status_code=400, detail="thread_id o phone requerido")
+    thread_id = (payload.thread_id or payload.phone or payload.name or "n8n-default-thread").strip()
 
     logger.info(
         "Payload /chat normalizado: thread_id=%s, name=%s, phone=%s, record_type=%s",

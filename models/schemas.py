@@ -20,7 +20,7 @@ Estándares aplicados:
 
 import json
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from typing import Dict, Any, Optional
 
 
@@ -38,33 +38,41 @@ class ChatRequest(BaseModel):
         5. Incluir `metadata` con campos adicionales (ej. `"source": "n8n"`)
            → debe ser aceptado sin errores.
     """
+    model_config = ConfigDict(populate_by_name=True)
+
     thread_id: str = Field(
         default="",
+        validation_alias=AliasChoices("thread_id", "session_id", "sessionId", "chat_id", "chatId"),
         description="ID único de sesión del cliente. Permite mantener el "
                     "estado conversacional y la persistencia en PostgreSQL."
     )
     message: str = Field(
         default="",
+        validation_alias=AliasChoices("message", "text", "mensaje", "body", "query", "input", "content"),
         description="Contenido del mensaje del cliente. Puede ser texto "
                     "plano, pregunta técnica o descripción de necesidad."
     )
     url_n8n_audio: str = Field(
         default="",
+        validation_alias=AliasChoices("url_n8n_audio", "audio_url", "audioUrl", "url_audio", "audio", "voice_url"),
         description="URL temporal enviada por n8n cuando el mensaje llega como audio. "
                     "Si viene vacia, se usa el campo message directamente."
     )
     name: str = Field(
         default="",
+        validation_alias=AliasChoices("name", "nombre", "pushName", "contact_name", "contactName"),
         description="Nombre del usuario o cliente que envía el mensaje. "
                     "Opcional, pero útil para personalizar la respuesta."
     )
     phone: str = Field(
         default="",
+        validation_alias=AliasChoices("phone", "telefono", "teléfono", "whatsapp", "from", "sender", "phone_number", "phoneNumber"),
         description="Número de teléfono del cliente. Opcional, pero útil "
                     "para canales que requieren contacto directo."
     )
-    record: str = Field(
+    record: list = Field(
         default="",
+        validation_alias=AliasChoices("record", "history", "historial", "conversation", "messages"),
         description="Historial de la conversación en formato JSON. Se utiliza para "
                     "mantener el contexto de la conversación."
     )
@@ -76,13 +84,38 @@ class ChatRequest(BaseModel):
     )
 
 
+    @field_validator("url_n8n_audio", mode="before")
+    @classmethod
+    def extraer_url_audio(cls, value):
+        if isinstance(value, dict):
+            for key in ("url", "audio_url", "audioUrl", "downloadUrl", "download_url"):
+                if value.get(key):
+                    return value[key]
+        if isinstance(value, list) and value:
+            first = value[0]
+            if isinstance(first, dict):
+                for key in ("url", "audio_url", "audioUrl", "downloadUrl", "download_url"):
+                    if first.get(key):
+                        return first[key]
+        return value
+
     @field_validator("thread_id", "message", "url_n8n_audio", "name", "phone", "record", mode="before")
     @classmethod
-    def normalizar_campos_texto(cls, value):
+    def normalizar_campos_texto(cls, value, info):
         if value is None:
             return ""
         if isinstance(value, str):
             return value
+        if info.field_name == "url_n8n_audio" and isinstance(value, dict):
+            for key in ("url", "audio_url", "audioUrl", "downloadUrl", "download_url"):
+                if value.get(key):
+                    return value[key]
+        if info.field_name == "url_n8n_audio" and isinstance(value, list) and value:
+            first = value[0]
+            if isinstance(first, dict):
+                for key in ("url", "audio_url", "audioUrl", "downloadUrl", "download_url"):
+                    if first.get(key):
+                        return first[key]
         if isinstance(value, (dict, list)):
             return json.dumps(value, ensure_ascii=False)
         return str(value)
