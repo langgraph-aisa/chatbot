@@ -180,6 +180,61 @@ def obtener_fragmento_ontologia(topologia: Optional[str]) -> str:
 
 
 # =============================================================================
+# Obtencion de productos estructurados para el flujo de preventa
+# =============================================================================
+def get_product_blocks(topologia: Optional[str], tipo: Optional[str] = None) -> List[str]:
+    """
+    Retorna los ids de bloques de productos por topologia y, opcionalmente,
+    filtrados por tipo ("sistema" o "unitario").
+    """
+    if not topologia:
+        base = ["11", "12", "13", "14", "15", "18", "20", "26", "38", "46", "51"]
+    elif "ON-GRID" in topologia.upper() or "ATADO" in topologia.upper():
+        base = [str(i) for i in range(1, 11)] + ["20", "35", "37", "38", "60", "61", "64", "79", "80", "81", "85"]
+    elif "OFF-GRID" in topologia.upper() or "AISLADO" in topologia.upper():
+        base = ["14", "16", "18", "19", "20", "22", "23", "24", "26", "27", "28", "32", "34", "35", "45", "46", "50", "51", "52", "53", "62", "64", "81", "82", "86"]
+    elif "BOMBA" in topologia.upper() or "HIDRO" in topologia.upper() or "BOMBEO" in topologia.upper():
+        base = ["12", "13", "15", "16", "39", "40", "41", "42", "55", "56", "57", "58", "59", "66", "73", "74", "77", "78", "83"]
+    else:
+        base = ["11", "12", "13", "14", "15", "18", "20", "26", "38", "46", "51"]
+
+    if not tipo:
+        return base
+
+    ontologia = cargar_ontologia()
+    return [
+        bloque_id
+        for bloque_id in base
+        if bloque_id in ontologia and ontologia[bloque_id].get("tipo") == tipo
+    ]
+
+
+def obtener_productos_relevantes(
+    topologia: str,
+    tipo: Optional[str] = None,
+    max_items: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Retorna hasta max_items productos del catalogo, con nombre, tag, url y tipo.
+    """
+    ontologia = cargar_ontologia()
+    productos: List[Dict[str, Any]] = []
+    for bloque_id in get_product_blocks(topologia, tipo)[:max_items]:
+        item = ontologia.get(bloque_id)
+        if not isinstance(item, dict):
+            continue
+        productos.append(
+            {
+                "nombre": item.get("nombre", ""),
+                "tag": item.get("tag", ""),
+                "url": item.get("url", ""),
+                "tipo": item.get("tipo", "desconocido"),
+            }
+        )
+    return productos
+
+
+# =============================================================================
 # NUEVA FUNCIÓN: Búsqueda de productos por mensaje (para recolección de datos)
 # =============================================================================
 def buscar_productos_por_mensaje(mensaje: str, top_n: int = 5) -> List[str]:

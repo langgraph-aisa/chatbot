@@ -50,6 +50,14 @@ async def actualizar_thread(
         }
 
         if existing:
+            old_meta = existing["metadata"] or {}
+            if isinstance(old_meta, str):
+                try:
+                    old_meta = json.loads(old_meta)
+                except json.JSONDecodeError:
+                    old_meta = {}
+            if "cumulative_cost" in old_meta:
+                metadata["cumulative_cost"] = old_meta["cumulative_cost"]
             # Actualizar
             await conn.execute(
                 """
@@ -63,6 +71,7 @@ async def actualizar_thread(
             )
             logger.info(f"Thread actualizado: {thread_id} - {nombre} ({whatsapp_norm})")
         else:
+            metadata["cumulative_cost"] = 0.0
             # Insertar
             await conn.execute(
                 """
@@ -145,6 +154,55 @@ async def registrar_evento_auditoria(
     except Exception as e:
         logger.error(f"Error al registrar evento de auditoría: {e}")
         return False
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def acumular_costo_thread(thread_id: str, costo: float) -> bool:
+    """
+    Acumula costo en metadata.cumulative_cost para un thread existente.
+    """
+    conn = None
+    try:
+        conn = await get_db_connection()
+        await conn.execute(
+            """
+            UPDATE threads
+            SET metadata = jsonb_set(
+                metadata,
+                '{cumulative_cost}',
+                to_jsonb(COALESCE((metadata->>'cumulative_cost')::numeric, 0) + $1)
+            )
+            WHERE thread_id = $2
+            """,
+            costo,
+            thread_id,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Error al acumular costo: {e}")
+        return False
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def obtener_costo_acumulado(thread_id: str) -> float:
+    """
+    Obtiene metadata.cumulative_cost para un thread.
+    """
+    conn = None
+    try:
+        conn = await get_db_connection()
+        row = await conn.fetchrow(
+            "SELECT metadata->>'cumulative_cost' as cost FROM threads WHERE thread_id = $1",
+            thread_id,
+        )
+        return float(row["cost"]) if row and row["cost"] else 0.0
+    except Exception as e:
+        logger.error(f"Error al obtener costo acumulado: {e}")
+        return 0.0
     finally:
         if conn:
             await conn.close()

@@ -30,6 +30,16 @@ if not API_KEY:
 
 app = Flask(__name__)
 
+
+def backend_headers(extra: dict | None = None) -> dict:
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if extra:
+        headers.update({k: v for k, v in extra.items() if v})
+    return headers
+
 # ---------------------------------------------------------------------------
 # Ruta principal: sirve la interfaz CLI
 # ---------------------------------------------------------------------------
@@ -59,17 +69,22 @@ def chat_stream():
 
     thread_id = data.get('thread_id', str(uuid.uuid4()))
     message = data['message']
+    metadata = dict(data.get("metadata") or {})
+    fingerprint = request.headers.get("X-Fingerprint") or metadata.get("fingerprint")
+    chat_id = request.headers.get("X-Chat-ID") or metadata.get("chat_id")
+    if fingerprint:
+        metadata["fingerprint"] = fingerprint
+    if chat_id:
+        metadata["chat_id"] = chat_id
     logger.info(f"Debug request | thread: {thread_id} | msg: {message[:50]}...")
 
     def generate():
         # Evento de inicio
         yield f"data: {json.dumps({'info': f'[DEBUG] Conectando a {BACKEND_URL}'})}\n\n"
 
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {"thread_id": thread_id, "message": message}
+        headers = backend_headers({"X-Fingerprint": fingerprint, "X-Chat-ID": chat_id})
+        payload = dict(data)
+        payload.update({"thread_id": thread_id, "message": message, "metadata": metadata})
 
         try:
             resp = requests.post(
@@ -102,6 +117,38 @@ def chat_stream():
             'X-Accel-Buffering': 'no'
         }
     )
+
+
+@app.route('/api/vision/analyze', methods=['POST'])
+def analyze_image_proxy():
+    data = request.get_json(silent=True) or {}
+    try:
+        resp = requests.post(
+            urljoin(BACKEND_URL, '/api/vision/analyze'),
+            json=data,
+            headers=backend_headers(),
+            timeout=120,
+        )
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
+    except Exception as e:
+        logger.error(f"Error proxy vision: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/stt', methods=['POST'])
+def speech_to_text_proxy():
+    data = request.get_json(silent=True) or {}
+    try:
+        resp = requests.post(
+            urljoin(BACKEND_URL, '/api/stt'),
+            json=data,
+            headers=backend_headers(),
+            timeout=120,
+        )
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
+    except Exception as e:
+        logger.error(f"Error proxy STT: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ---------------------------------------------------------------------------
 # Endpoint de historial (para futura implementación)

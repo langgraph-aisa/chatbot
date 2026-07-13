@@ -88,15 +88,8 @@ class AudioTranscriptionService:
                     f"No se pudo descargar el audio: HTTP {exc.response.status_code}."
                 ) from exc
             except httpx.HTTPError as exc:
-                logger.error(
-                    "Error descargando audio. url=%s status=%s body=%s",
-                    audio_url,
-                    exc.response.status_code,
-                    exc.response.text[:500],
-                )
-                raise AudioTranscriptionError(
-                    f"No se pudo descargar el audio: HTTP {exc.response.status_code}."
-                ) from exc
+                logger.error("Error descargando audio. url=%s error=%s", audio_url, exc)
+                raise AudioTranscriptionError("No se pudo descargar el audio.") from exc
 
         audio_bytes = b"".join(chunks)
         if not audio_bytes:

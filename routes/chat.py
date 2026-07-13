@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse
 
 from models.schemas import ChatRequest
 from services.audio_service import AudioTranscriptionError
-from services.chat_service import ChatService
+from services.chat_service import ChatService, obtener_caso
 
 
 router = APIRouter()
@@ -20,8 +20,10 @@ def get_chat_service(request: Request) -> ChatService:
 
 
 @router.post("/chat")
+@router.post("/api/chat/stream")
 async def chat_endpoint(
     payload: ChatRequest,
+    http_request: Request,
     chat_service: ChatService = Depends(get_chat_service),
 ):
     try:
@@ -47,23 +49,64 @@ async def chat_endpoint(
             },
         )
 
-    thread_id = (payload.thread_id or payload.phone or payload.name or "n8n-default-thread").strip()
+    metadata = dict(payload.metadata or {})
+    fingerprint = http_request.headers.get("X-Fingerprint") or metadata.get("fingerprint")
+    if fingerprint:
+        metadata["fingerprint"] = fingerprint
+
+    chat_id = (
+        payload.chat_id
+        or metadata.get("chat_id")
+        or http_request.headers.get("X-Chat-ID")
+        or payload.thread_id
+        or payload.phone
+        or payload.name
+        or "n8n-default-chat"
+    )
+    thread_id = (
+        payload.thread_id
+        or payload.chat_id
+        or payload.phone
+        or payload.name
+        or fingerprint
+        or "n8n-default-thread"
+    ).strip()
+    chat_id = str(chat_id).strip()
+    metadata["origen"] = str(metadata.get("origen") or metadata.get("source") or "n8n")
+
+    contexto_inicial = {}
+    if payload.name:
+        contexto_inicial["nombre"] = payload.name
+    if payload.phone:
+        contexto_inicial["whatsapp"] = payload.phone
 
     logger.info(
-        "Payload /chat normalizado: thread_id=%s, name=%s, phone=%s, record_items=%s",
+        "Payload /chat normalizado: thread_id=%s, chat_id=%s, name=%s, phone=%s, record_items=%s",
         thread_id,
+        chat_id,
         payload.name,
         payload.phone,
         len(payload.record),
     )
 
     return StreamingResponse(
-        chat_service.generar_tokens(thread_id, message, payload.record),
+        chat_service.generar_tokens(
+            thread_id,
+            message,
+            payload.record,
+            chat_id=chat_id,
+            metadata=metadata,
+            contexto_inicial=contexto_inicial,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "X-Chat-ID": chat_id,
+            "X-Thread-ID": thread_id,
+            "X-Run-Name": obtener_caso(thread_id),
+            "X-Origen": metadata["origen"],
             "Access-Control-Allow-Origin": "*",
         },
     )

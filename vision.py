@@ -20,6 +20,7 @@ Estándares aplicados:
 import base64
 import json
 import os
+import requests
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
@@ -41,12 +42,18 @@ def _obtener_cliente_openai() -> OpenAI:
         - Con OPENAI_API_KEY definida: devuelve una instancia de OpenAI.
         - Sin la variable: lanza RuntimeError.
     """
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY_1") or os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY_2")
     if not api_key:
         raise RuntimeError(
-            "No se puede procesar la imagen: OPENAI_API_KEY no configurada."
+            "No se puede procesar la imagen: no hay API key de OpenAI configurada."
         )
     return OpenAI(api_key=api_key)
+
+
+def descargar_imagen_desde_url(url: str) -> bytes:
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.content
 
 
 def procesar_imagen_factura(base64_image: str) -> dict:
@@ -128,3 +135,9 @@ def procesar_imagen_factura(base64_image: str) -> dict:
         "monto_factura": datos.get("monto_factura", None)
     }
     return resultado
+
+
+def procesar_imagen_desde_url(url: str) -> dict:
+    image_bytes = descargar_imagen_desde_url(url)
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    return procesar_imagen_factura(base64_image)

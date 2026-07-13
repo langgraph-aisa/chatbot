@@ -43,6 +43,10 @@ class ChatRequest(BaseModel):
         description="ID único de sesión del cliente. Permite mantener el "
                     "estado conversacional y la persistencia en PostgreSQL."
     )
+    chat_id: str = Field(
+        default="",
+        description="ID externo del canal, por ejemplo Odoo, WhatsApp o debug UI."
+    )
     message: str = Field(
         default="",
         description="Contenido del mensaje del cliente. Puede ser texto "
@@ -85,6 +89,7 @@ class ChatRequest(BaseModel):
         normalized = dict(data)
         alias_groups = {
             "thread_id": ("session_id", "sessionId", "chat_id", "chatId"),
+            "chat_id": ("chatId", "conversation_id", "conversationId"),
             "message": ("text", "mensaje", "body", "query", "input", "content"),
             "url_n8n_audio": ("audio_url", "audioUrl", "url_audio", "audio", "voice_url"),
             "name": ("nombre", "pushName", "contact_name", "contactName"),
@@ -147,7 +152,7 @@ class ChatRequest(BaseModel):
                 return [parsed]
         return []
 
-    @field_validator("thread_id", "message", "url_n8n_audio", "name", "phone", mode="before")
+    @field_validator("thread_id", "chat_id", "message", "url_n8n_audio", "name", "phone", mode="before")
     @classmethod
     def normalizar_campos_texto(cls, value, info):
         if value is None:
@@ -207,7 +212,8 @@ class AudioRequest(BaseModel):
     Modelo para la solicitud de transcripción (Speech‑to‑Text).
     Pendiente de implementación completa en la API.
     """
-    thread_id: str = Field(..., description="ID de sesión asociado al audio.")
+    thread_id: str = Field(default="", description="ID de sesion asociado al audio.")
+    url: str = Field(default="", description="URL publica o temporal del audio.")
     # Se espera que el audio se envíe como multipart/form-data; este modelo
     # es una representación conceptual.
 
@@ -217,8 +223,9 @@ class ImageRequest(BaseModel):
     Modelo para la solicitud de análisis de factura (visión artificial).
     Pendiente de implementación completa en la API.
     """
-    thread_id: str = Field(..., description="ID de sesión asociado a la imagen.")
-    image_base64: str = Field(..., description="Imagen codificada en Base64.")
+    thread_id: str = Field(default="", description="ID de sesion asociado a la imagen.")
+    image_base64: str = Field(default="", description="Imagen codificada en Base64.")
+    url: str = Field(default="", description="URL publica o temporal de la imagen.")
 
 
 class TTSRequest(BaseModel):

@@ -37,14 +37,13 @@
             font-size: 0.9rem;
             line-height: 1.6;
             min-height: 0;
-            margin-bottom: 20px;
+            margin-bottom: 10px;
         }
-        #output .system { color: #66aaff; }
-        #output .user { color: #ffcc00; font-weight: bold; }
-        #output .assistant { color: #00ff99; }
-        #output .error { color: #ff4444; background: #331111; padding: 2px 6px; border-radius: 4px; }
-        #output .context { color: #8888ff; font-style: italic; border-top: 1px solid #333; margin-top: 8px; padding-top: 8px; }
-        #output .raw { color: #aa66ff; font-size: 0.8rem; }
+        .message-user { color: #ffcc00; font-weight: bold; margin: 6px 0 2px 0; }
+        .message-assistant { color: #00ff99; margin: 4px 0 8px 0; padding-left: 10px; border-left: 2px solid #00ff99; }
+        .message-context { color: #8888ff; font-style: italic; border-top: 1px solid #333; margin-top: 8px; padding-top: 8px; font-size: 0.8rem; }
+        .message-system { color: #66aaff; margin: 4px 0; }
+        .message-error { color: #ff4444; background: #331111; padding: 2px 6px; border-radius: 4px; }
         #input-area {
             display: flex;
             gap: 10px;
@@ -77,8 +76,39 @@
         }
         #input-area button:hover { background: #66ffaa; }
         #input-area button:disabled { opacity: 0.5; cursor: not-allowed; }
-        .log-line { padding: 2px 0; border-bottom: 1px solid #1a1a1a; }
+        .tool-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #2a2a2a;
+            margin-bottom: 10px;
+        }
+        .tool-row input[type="text"] {
+            flex: 1;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            color: #00ff99;
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+        }
+        .tool-row button {
+            background: #0066cc;
+            color: white;
+            border: none;
+            padding: 6px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .tool-row button:hover { background: #0055aa; }
         .separator { border: none; border-top: 1px dashed #2a4a2a; margin: 6px 0; }
+        .typing { color: #66ffaa; animation: pulse 1s infinite; }
+        @keyframes pulse {
+            0% { opacity: 0.4; }
+            50% { opacity: 1; }
+            100% { opacity: 0.4; }
+        }
     </style>
 </head>
 <body>
@@ -86,24 +116,52 @@
         <span class="title">⚡ JARVI · DEBUG CONSOLE</span>
         <span class="status" id="status">🟢 Conectado a: <span id="backend-url">{{ backend_url }}</span></span>
     </div>
+    <div class="tool-row">
+        <input type="text" id="url-input" placeholder="Pega aquí el enlace de imagen (.jpg, .png) o audio (.mp3, .wav)">
+        <button id="process-url-btn">Procesar</button>
+        <span style="color: #aaa; font-size: 0.8rem;">|</span>
+        <button id="clear-btn" style="background: #663333;">Limpiar</button>
+    </div>
     <div id="output">
-        <div class="system">[Sistema] Consola de depuración iniciada.</div>
-        <div class="system">[Sistema] Escribe tu mensaje y presiona Enter.</div>
-        <div class="system" id="thread-display">[Sistema] Thread ID: <span id="thread-id">(cargando...)</span></div>
+        <div class="message-system">[Sistema] Consola de depuración iniciada.</div>
+        <div class="message-system">[Sistema] Escribe tu mensaje o pega un enlace de archivo multimedia.</div>
+        <div class="message-system" id="thread-display">[Sistema] Thread ID: <span id="thread-id">(cargando...)</span></div>
         <hr class="separator">
     </div>
     <div id="input-area">
         <input type="text" id="user-input" placeholder="Escribe tu mensaje de depuración..." autofocus>
         <button id="send-btn">Enviar</button>
     </div>
+
     <script>
         (function() {
-            const output = document.getElementById('output');
-            const input = document.getElementById('user-input');
-            const sendBtn = document.getElementById('send-btn');
-            const threadDisplay = document.getElementById('thread-id');
+            // =====================================================
+            // 1. GENERACIÓN DEL FINGERPRINT (traza de pantalla)
+            // =====================================================
+            async function generarFingerprint() {
+                let fp = localStorage.getItem('jarvi_fingerprint');
+                if (fp) return fp;
+                const screenData = `${window.screen.width}x${window.screen.height}_${window.devicePixelRatio}`;
+                let gpu = "unknown";
+                try {
+                    const canvas = document.createElement('canvas');
+                    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                    gpu = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
+                } catch (e) {}
+                const raw = `${screenData}_${gpu}`;
+                const encoder = new TextEncoder();
+                const data = encoder.encode(raw);
+                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                fp = hashArray.map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 32);
+                localStorage.setItem('jarvi_fingerprint', fp);
+                return fp;
+            }
 
-            let currentThreadId = null;
+            // =====================================================
+            // 2. ID DE THREAD (persistente)
+            // =====================================================
             function getThreadId() {
                 let tid = localStorage.getItem('debug_thread_id');
                 if (!tid) {
@@ -112,53 +170,63 @@
                 }
                 return tid;
             }
-            currentThreadId = getThreadId();
+
+            // =====================================================
+            // 3. VARIABLES GLOBALES Y DOM
+            // =====================================================
+            const output = document.getElementById('output');
+            const input = document.getElementById('user-input');
+            const sendBtn = document.getElementById('send-btn');
+            const threadDisplay = document.getElementById('thread-id');
+            const urlInput = document.getElementById('url-input');
+            const processUrlBtn = document.getElementById('process-url-btn');
+            const clearBtn = document.getElementById('clear-btn');
+
+            let currentThreadId = getThreadId();
             threadDisplay.textContent = currentThreadId;
+            let chatId = localStorage.getItem('jarvi_chat_id') || '';
+            let fingerprint = '';
 
-            let currentAssistantMessage = '';
-            let assistantDiv = null;
-
-            function appendLog(text, type = 'assistant') {
+            // =====================================================
+            // 4. FUNCIONES DE MENSAJES EN EL OUTPUT
+            // =====================================================
+            function addMessage(text, type = 'assistant') {
                 const div = document.createElement('div');
-                div.className = `log-line ${type}`;
+                div.className = `message-${type}`;
                 div.textContent = text;
                 output.appendChild(div);
                 output.scrollTop = output.scrollHeight;
                 return div;
             }
+            function addUserMessage(text) { addMessage(text, 'user'); }
+            function addSystemMessage(text) { addMessage(text, 'system'); }
+            function addErrorMessage(text) { addMessage(text, 'error'); }
 
-            function appendUserMessage(text) {
-                appendLog(`> ${text}`, 'user');
-            }
+            let assistantDiv = null;
+            let currentAssistantMessage = '';
 
             function startAssistantMessage() {
                 currentAssistantMessage = '';
                 assistantDiv = document.createElement('div');
-                assistantDiv.className = 'log-line assistant';
-                assistantDiv.id = 'assistant-current';
+                assistantDiv.className = 'message-assistant';
                 assistantDiv.textContent = '▌';
                 output.appendChild(assistantDiv);
                 output.scrollTop = output.scrollHeight;
             }
-
             function appendToken(token) {
-                if (!assistantDiv) {
-                    startAssistantMessage();
-                }
+                if (!assistantDiv) startAssistantMessage();
                 currentAssistantMessage += token;
                 assistantDiv.textContent = currentAssistantMessage + '▌';
                 output.scrollTop = output.scrollHeight;
             }
-
             function finishAssistantMessage(contexto = null) {
                 if (assistantDiv) {
                     assistantDiv.textContent = currentAssistantMessage;
-                    assistantDiv.id = '';
                     assistantDiv = null;
                 }
                 if (contexto && Object.keys(contexto).length > 0) {
                     const ctxDiv = document.createElement('div');
-                    ctxDiv.className = 'log-line context';
+                    ctxDiv.className = 'message-context';
                     ctxDiv.textContent = `[CONTEXTO] ${JSON.stringify(contexto, null, 2)}`;
                     output.appendChild(ctxDiv);
                     output.scrollTop = output.scrollHeight;
@@ -166,17 +234,23 @@
                 currentAssistantMessage = '';
             }
 
-            async function sendMessage() {
-                const message = input.value.trim();
+            // =====================================================
+            // 5. ENVÍO DE MENSAJE CON FINGERPRINT Y CHAT_ID
+            // =====================================================
+            async function sendMessage(message) {
                 if (!message) return;
-
-                appendUserMessage(message);
+                addUserMessage(message);
                 input.value = '';
                 input.disabled = true;
                 sendBtn.disabled = true;
 
+                // Obtener fingerprint (si no existe, se genera y guarda)
+                if (!fingerprint) {
+                    fingerprint = await generarFingerprint();
+                }
+
                 const loadingDiv = document.createElement('div');
-                loadingDiv.className = 'log-line assistant';
+                loadingDiv.className = 'message-assistant typing';
                 loadingDiv.textContent = '...';
                 loadingDiv.id = 'loading-indicator';
                 output.appendChild(loadingDiv);
@@ -185,16 +259,35 @@
                 try {
                     const response = await fetch('/api/chat/stream', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ thread_id: currentThreadId, message: message })
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Fingerprint': fingerprint,        // <--- ENVÍA EL FINGERPRINT
+                            'X-Chat-ID': chatId
+                        },
+                        body: JSON.stringify({
+                            thread_id: currentThreadId,
+                            message: message,
+                            metadata: {
+                                fingerprint: fingerprint,
+                                chat_id: chatId
+                            }
+                        })
                     });
+
+                    // Leer el header X-Chat-ID de la respuesta y almacenarlo
+                    const newChatId = response.headers.get('X-Chat-ID');
+                    if (newChatId && newChatId !== chatId) {
+                        chatId = newChatId;
+                        localStorage.setItem('jarvi_chat_id', chatId);
+                        addSystemMessage(`[Sistema] Chat ID actualizado: ${chatId}`);
+                    }
 
                     const loader = document.getElementById('loading-indicator');
                     if (loader) loader.remove();
 
                     if (!response.ok) {
                         const errText = await response.text();
-                        appendLog(`[ERROR] HTTP ${response.status}: ${errText}`, 'error');
+                        addErrorMessage(`Error HTTP ${response.status}: ${errText}`);
                         return;
                     }
 
@@ -208,7 +301,6 @@
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) break;
-
                         buffer += decoder.decode(value, { stream: true });
                         let lines = buffer.split('\n');
                         buffer = lines.pop() || '';
@@ -216,38 +308,37 @@
                         for (let line of lines) {
                             line = line.trim();
                             if (!line || !line.startsWith('data: ')) continue;
-
                             const jsonStr = line.slice(6);
                             try {
                                 const data = JSON.parse(jsonStr);
-
-                                if (data.token) {
+                                if (data.token !== undefined) {
                                     appendToken(data.token);
                                 } else if (data.info) {
-                                    appendLog(`[INFO] ${data.info}`, 'system');
+                                    addSystemMessage(`[INFO] ${data.info}`);
                                 } else if (data.error) {
-                                    appendLog(`[ERROR] ${data.error}`, 'error');
+                                    addErrorMessage(`[ERROR] ${data.error}`);
                                 } else if (data.contexto_tecnico) {
                                     contexto = data.contexto_tecnico;
+                                    if (contexto.chat_id) {
+                                        chatId = contexto.chat_id;
+                                        localStorage.setItem('jarvi_chat_id', chatId);
+                                    }
                                     finishAssistantMessage(contexto);
                                 } else {
-                                    // Evento no clasificado: mostrarlo como raw para depuración
-                                    appendLog(`[RAW] ${jsonStr}`, 'raw');
+                                    addSystemMessage(`[EVENTO] ${jsonStr}`);
                                 }
                             } catch (e) {
-                                appendLog(`[PARSE_ERROR] ${jsonStr}`, 'error');
+                                addSystemMessage(`[PARSE] ${jsonStr}`);
                             }
                         }
                     }
-
                     if (currentAssistantMessage) {
                         finishAssistantMessage();
                     }
-
                 } catch (error) {
                     const loader = document.getElementById('loading-indicator');
                     if (loader) loader.remove();
-                    appendLog(`[EXCEPCIÓN] ${error.message}`, 'error');
+                    addErrorMessage(`Excepción: ${error.message}`);
                 } finally {
                     input.disabled = false;
                     sendBtn.disabled = false;
@@ -255,12 +346,85 @@
                 }
             }
 
-            sendBtn.addEventListener('click', sendMessage);
+            // =====================================================
+            // 6. EVENTOS DE LA INTERFAZ
+            // =====================================================
+            processUrlBtn.addEventListener('click', async () => {
+                const url = urlInput.value.trim();
+                if (!url) {
+                    addErrorMessage('Por favor, pega una URL válida.');
+                    return;
+                }
+                const lower = url.toLowerCase();
+                let endpoint = '';
+                let desc = '';
+                if (lower.match(/\.(jpg|jpeg|png|gif|bmp|webp)$/)) {
+                    endpoint = '/api/vision/analyze';
+                    desc = 'Imagen';
+                } else if (lower.match(/\.(mp3|wav|m4a|flac|ogg|aac)$/)) {
+                    endpoint = '/api/stt';
+                    desc = 'Audio';
+                } else {
+                    addErrorMessage('El enlace no parece ser de imagen o audio válido.');
+                    return;
+                }
+                addSystemMessage(`Procesando ${desc} desde URL: ${url}`);
+                try {
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: url })
+                    });
+                    const data = await response.json();
+                    if (response.ok) {
+                        if (endpoint === '/api/vision/analyze') {
+                            const extracted = data.extracted_data || {};
+                            addSystemMessage(`Factura: Empresa: ${extracted.empresa_electrica || 'N/A'}, Consumo: ${extracted.consumo_kwh || 'N/A'} kWh, Monto: Q${extracted.monto_factura || 'N/A'}`);
+                        } else if (endpoint === '/api/stt') {
+                            const transcript = data.transcript || '';
+                            addSystemMessage(`Transcripción: ${transcript}`);
+                        }
+                        urlInput.value = '';
+                    } else {
+                        addErrorMessage(`Error: ${data.error || 'Desconocido'}`);
+                    }
+                } catch (error) {
+                    addErrorMessage(`Excepción al procesar URL: ${error.message}`);
+                }
+            });
+
+            clearBtn.addEventListener('click', () => {
+                while (output.children.length > 0) {
+                    output.removeChild(output.lastChild);
+                }
+                addSystemMessage('Consola limpiada.');
+                addSystemMessage('Escribe tu mensaje o pega un enlace de archivo multimedia.');
+                const sys3 = document.createElement('div');
+                sys3.className = 'message-system';
+                sys3.innerHTML = 'Thread ID: <span id="thread-id">' + currentThreadId + '</span>';
+                output.appendChild(sys3);
+                const sep = document.createElement('hr');
+                sep.className = 'separator';
+                output.appendChild(sep);
+            });
+
+            sendBtn.addEventListener('click', () => {
+                const msg = input.value.trim();
+                if (msg) sendMessage(msg);
+            });
             input.addEventListener('keydown', (e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault();
-                    sendMessage();
+                    const msg = input.value.trim();
+                    if (msg) sendMessage(msg);
                 }
+            });
+
+            // Al iniciar, mostrar el fingerprint en consola (para depuración)
+            generarFingerprint().then(fp => {
+                console.log('Fingerprint generado:', fp);
+                // Opcional: mostrar en la interfaz
+                // addSystemMessage(`[Fingerprint] ${fp}`);
             });
 
             input.focus();

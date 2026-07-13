@@ -16,6 +16,11 @@ logger = logging.getLogger("jarvi.api")
 MAX_RECORD_MESSAGES = int(os.getenv("MAX_N8N_RECORD_MESSAGES", "20"))
 
 
+def obtener_caso(thread_id: str) -> str:
+    normalized = (thread_id or "").replace("-", "")
+    return normalized[-12:] if normalized else "000000000000"
+
+
 class ChatService:
     def __init__(self, graph: Any, audio_service: AudioTranscriptionService | None = None):
         self.graph = graph
@@ -96,9 +101,27 @@ class ChatService:
         thread_id: str,
         mensaje: str,
         record: list[dict[str, Any]] | None = None,
+        chat_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        contexto_inicial: dict[str, Any] | None = None,
     ) -> AsyncGenerator[str, None]:
         trace_id = trace_id_var.get()
-        config = {"configurable": {"thread_id": thread_id}, "metadata": {"trace_id": trace_id}}
+        caso = obtener_caso(thread_id)
+        chat_identifier = (chat_id or thread_id).strip()
+        metadata_config = {
+            "trace_id": trace_id,
+            "chat_id": chat_identifier,
+            "caso": caso,
+            "origen": "n8n",
+        }
+        if metadata:
+            metadata_config.update({k: v for k, v in metadata.items() if v not in (None, "")})
+
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "metadata": metadata_config,
+            "run_name": caso,
+        }
 
         async with self.locks[thread_id]:
             record_messages = []
@@ -110,7 +133,7 @@ class ChatService:
 
             estado_inicial = {
                 "messages": [*record_messages, HumanMessage(content=mensaje)],
-                "contexto_tecnico": {},
+                "contexto_tecnico": dict(contexto_inicial or {}),
             }
 
             logger.info(
@@ -141,4 +164,16 @@ class ChatService:
                 fallback = "No se pudo generar una respuesta. Por favor, intenta de nuevo."
                 yield f"data: {json.dumps({'token': fallback}, ensure_ascii=False)}\n\n"
 
-            yield f"data: {json.dumps({'contexto_tecnico': ctx}, ensure_ascii=False)}\n\n"
+            ctx_para_envio = dict(ctx)
+            ctx_para_envio.update(
+                {
+                    "chat_id": chat_identifier,
+                    "thread_id": thread_id,
+                    "caso": caso,
+                    "run_name_actual": config["run_name"],
+                    "origen": metadata_config.get("origen", "n8n"),
+                    "fingerprint": metadata_config.get("fingerprint"),
+                    "historial_externo_count": len(record or []),
+                }
+            )
+            yield f"data: {json.dumps({'contexto_tecnico': ctx_para_envio}, ensure_ascii=False)}\n\n"
