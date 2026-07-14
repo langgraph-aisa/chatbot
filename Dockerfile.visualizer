@@ -41,8 +41,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
         langgraph-checkpoint-postgres==1.0.4 \
         langchain-core==0.2.43 \
         redis==5.0.0 \
-        langgraph-cli[inmem]>=0.4.31 \
-        langsmith<0.2.0
+        "langgraph-cli[inmem]>=0.4.31" \
+        "langsmith<0.2.0"
 
 # Copiar el código fuente
 COPY . .
