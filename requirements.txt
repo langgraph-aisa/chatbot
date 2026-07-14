@@ -55,7 +55,7 @@ rapidfuzz>=3.0.0                # Fuzzy matching eficiente
 # ---------------------------------------------------------------------
 langgraph-checkpoint>=1.0.0      # Persistencia de estados del grafo
 langgraph-checkpoint-postgres>=3.0.0 # Adaptador para PostgreSQL
-langchain-core==0.2.38            # Núcleo de LangChain (dependencia base)
+langchain-core==0.2.43            # Núcleo de LangChain (compatible con langgraph 0.2.61: >=0.2.43,<0.4.0)
 
 # =============================================================================
 # Nota: langgraph-api y langgraph-cli NO se incluyen porque son específicos
