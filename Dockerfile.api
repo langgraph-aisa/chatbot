@@ -32,11 +32,6 @@ RUN python -c "import langfuse, asyncpg, redis; print('✅ Dependencias crítica
 # Copiar código fuente
 COPY . .
 
-# =============================================================================
-# RENOMBRAR api.py a api_new.py PARA FORZAR EL USO DEL NUEVO CÓDIGO
-# =============================================================================
-RUN mv /app/api.py /app/api_new.py
-
 # Verificación explícita de que el archivo nuevo tiene los prints de diagnóstico
 RUN grep -q "🔍 Respuesta final:" /app/api_new.py && echo "✅ api_new.py contiene diagnóstico" || echo "❌ api_new.py NO contiene diagnóstico"
 RUN grep -q "ON CONFLICT (thread_id)" /app/db_client.py && echo "✅ db_client.py tiene UPSERT" || echo "❌ db_client.py antiguo"
