@@ -1,7 +1,7 @@
 """
 agent_graph.py - Grafo agéntico de JARVI 2.0 con instrumentación CTFOM.
-VERSIÓN 2.6.0 – Restauración de output y costos en Langfuse.
-31JUL2026.
+VERSIÓN 2.7.9 – Búsqueda flexible con difflib y selección de opciones (corregida).
+17AGO2026.
 """
 import os
 import time
@@ -10,10 +10,12 @@ import asyncio
 import requests
 import re
 import json
+import difflib
 import functools
 import logging
 from typing import Annotated, TypedDict, Optional, List, Dict, Any
 from pydantic import BaseModel, Field
+from datetime import datetime, timezone
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -51,6 +53,12 @@ import openai
 import asyncpg
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+# =============================================================================
+# IMPORTACIÓN DEL CLIENTE ODOO Y PRICE EXTRACTOR
+# =============================================================================
+from odoo_db_client import odoo_db_client
+from price_extractor import extract_price_from_url
+
 logger = logging.getLogger(__name__)
 from config import settings
 
@@ -64,44 +72,24 @@ _epistemology = None
 _epistemology_lock = asyncio.Lock()
 
 # =============================================================================
-# FUNCIÓN PARA INICIALIZAR ORQUESTADOR DE FORMA LAZY (POR WORKER)
+# FUNCIÓN PARA NORMALIZAR CONSULTA DEL USUARIO (fuera de create_graph)
 # =============================================================================
-async def get_epistemology():
-    """Obtiene o inicializa el orquestador de forma lazy (por worker)."""
-    global _epistemology
-    if _epistemology is not None:
-        return _epistemology
-    async with _epistemology_lock:
-        if _epistemology is not None:
-            return _epistemology
-        try:
-            ctfom_db_url = settings.ctfom_database_url
-            if ctfom_db_url:
-                parsed = urlparse(ctfom_db_url)
-                query = parse_qs(parsed.query)
-                for key in ["pool_size", "max_overflow", "pool_timeout"]:
-                    query.pop(key, None)
-                clean_query = urlencode(query, doseq=True)
-                clean_url = urlunparse(parsed._replace(query=clean_query))
-                pool = await asyncpg.create_pool(clean_url, min_size=1, max_size=5)
-                repo = ProjectRepository(pool)
-                openai_client = openai.OpenAI(api_key=settings.openai_api_key)
-                _epistemology = EpistemologyOrchestrator(repo, openai_client)
-                logger.info("Orquestador inicializado lazy con CTFOM")
-            else:
-                from api_v2 import MemoryRepo
-                repo = MemoryRepo()
-                openai_client = openai.OpenAI(api_key=settings.openai_api_key)
-                _epistemology = EpistemologyOrchestrator(repo, openai_client)
-                logger.info("Orquestador inicializado lazy en memoria")
-        except Exception as e:
-            logger.error(f"Error en inicialización lazy del orquestador: {e}")
-            from api_v2 import MemoryRepo
-            repo = MemoryRepo()
-            openai_client = openai.OpenAI(api_key=settings.openai_api_key)
-            _epistemology = EpistemologyOrchestrator(repo, openai_client)
-            logger.warning("Orquestador inicializado lazy en memoria (fallback)")
-        return _epistemology
+def normalizar_consulta(texto: str) -> str:
+    """
+    Limpia y extrae términos clave de la consulta del usuario.
+    Elimina palabras vacías, conserva números, unidades y palabras técnicas.
+    """
+    if not texto:
+        return ""
+    texto = re.sub(r'\[caso no\..*?\]', '', texto, flags=re.IGNORECASE)
+    stopwords = {'por', 'favor', 'dame', 'precio', 'información', 'info', 
+                 'solo', 'solamente', 'necesito', 'quiero', 'consultar',
+                 'producto', 'batería', 'bateria', 'gel', 'ah', 'v', 'volt',
+                 'de', 'la', 'el', 'los', 'las', 'para', 'con', 'sin', 'y', 'o',
+                 'porfavor', 'dademe', 'soloe', 'vaor'}
+    tokens = re.findall(r'[a-záéíóúñ]+|\d+\.?\d*', texto.lower())
+    tokens_filtrados = [t for t in tokens if t not in stopwords and len(t) > 1]
+    return " ".join(tokens_filtrados)
 
 # =============================================================================
 # CARGA DEL MARCO ACADÉMICO (REFERENCIAS APA)
@@ -155,7 +143,7 @@ def get_llm():
         temperature=0.1,
         timeout=60.0,
         max_retries=5,
-        default_headers={"User-Agent": "JARVI/2.6.0"}
+        default_headers={"User-Agent": "JARVI/2.7.9"}
     )
 
 # =============================================================================
@@ -241,9 +229,17 @@ class InferenciaEnergetica(TypedDict):
     authorization_asked: Optional[bool]
     conversation_end: Optional[bool]
     derivation_offered: Optional[bool]
+    catalog_search_mode: Optional[bool]
+    awaiting_expansion: Optional[bool]
+    current_product_id: Optional[int]
+    odoo_search_results: Optional[List[Dict]]
+    fuente_producto: Optional[str]
     micdp_accepted: Optional[bool]
     micdp_offered: Optional[bool]
     micdp_active: Optional[bool]
+    catalog_search_attempted: Optional[bool]
+    esperando_seleccion: Optional[bool]
+    productos_opciones: Optional[List[tuple]]
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
@@ -346,7 +342,7 @@ def observe_node(layer: str = "graph", node_name: str = ""):
     return decorator
 
 # =============================================================================
-# HERRAMIENTA DE ENVÍO A N8N (SIN @auditar_fase PARA EVITAR COLISIÓN)
+# HERRAMIENTA DE ENVÍO A N8N
 # =============================================================================
 @tool
 async def procesar_oportunidad_backend(
@@ -361,7 +357,6 @@ async def procesar_oportunidad_backend(
 ) -> str:
     """
     Envía los datos del proyecto al backend de oportunidades (N8N) para su gestión comercial.
-    Esta herramienta es invocada por el agente cuando el usuario ha definido claramente su necesidad.
     """
     start_time = time.perf_counter()
     try:
@@ -430,7 +425,47 @@ def extraer_tipo_producto(mensaje: str) -> Optional[str]:
     return None
 
 # =============================================================================
-# CONSTRUCCIÓN DEL GRAFO
+# FUNCIÓN PARA INICIALIZAR ORQUESTADOR DE FORMA LAZY (POR WORKER)
+# =============================================================================
+async def get_epistemology():
+    """Obtiene o inicializa el orquestador de forma lazy (por worker)."""
+    global _epistemology
+    if _epistemology is not None:
+        return _epistemology
+    async with _epistemology_lock:
+        if _epistemology is not None:
+            return _epistemology
+        try:
+            ctfom_db_url = settings.ctfom_database_url
+            if ctfom_db_url:
+                parsed = urlparse(ctfom_db_url)
+                query = parse_qs(parsed.query)
+                for key in ["pool_size", "max_overflow", "pool_timeout"]:
+                    query.pop(key, None)
+                clean_query = urlencode(query, doseq=True)
+                clean_url = urlunparse(parsed._replace(query=clean_query))
+                pool = await asyncpg.create_pool(clean_url, min_size=1, max_size=5)
+                repo = ProjectRepository(pool)
+                openai_client = openai.OpenAI(api_key=settings.openai_api_key)
+                _epistemology = EpistemologyOrchestrator(repo, openai_client)
+                logger.info("Orquestador inicializado lazy con CTFOM")
+            else:
+                from api_v2 import MemoryRepo
+                repo = MemoryRepo()
+                openai_client = openai.OpenAI(api_key=settings.openai_api_key)
+                _epistemology = EpistemologyOrchestrator(repo, openai_client)
+                logger.info("Orquestador inicializado lazy en memoria")
+        except Exception as e:
+            logger.error(f"Error en inicialización lazy del orquestador: {e}")
+            from api_v2 import MemoryRepo
+            repo = MemoryRepo()
+            openai_client = openai.OpenAI(api_key=settings.openai_api_key)
+            _epistemology = EpistemologyOrchestrator(repo, openai_client)
+            logger.warning("Orquestador inicializado lazy en memoria (fallback)")
+        return _epistemology
+
+# =============================================================================
+# CONSTRUCCIÓN DEL GRAFO (dentro de esta función se definen los nodos)
 # =============================================================================
 def create_graph(checkpointer: BaseCheckpointSaver):
     graph_builder = StateGraph(AgentState)
@@ -446,6 +481,15 @@ def create_graph(checkpointer: BaseCheckpointSaver):
     async def clasificar_intencion_comercial_node(state: AgentState):
         ctx = dict(state.get("contexto_tecnico") or {})
         ultimo = extraer_intencion_humana(state.get("messages", []))
+
+        messages = state.get("messages", [])
+        if messages and isinstance(messages[-1], HumanMessage):
+            ctx["catalog_search_attempted"] = False
+            ctx["catalog_search_mode"] = False
+            ctx["awaiting_expansion"] = False
+            ctx["esperando_seleccion"] = False
+            ctx["productos_opciones"] = []
+
         if not ultimo:
             return {"contexto_tecnico": ctx}
         if ctx.get("topologia"):
@@ -480,7 +524,7 @@ def create_graph(checkpointer: BaseCheckpointSaver):
         return {"contexto_tecnico": ctx}
 
     # -------------------------------------------------------------------------
-    # NODO 3: SELECCIÓN DE PRODUCTOS (CON SUPERVISIÓN)
+    # NODO 3: SELECCIÓN DE PRODUCTOS (CON FUZZY MATCHING Y OPCIONES)
     # -------------------------------------------------------------------------
     @auditar_fase(nombre_fase="Selección de Productos", criticidad="ALTA")
     @observe_node(node_name="seleccionar_productos")
@@ -491,66 +535,297 @@ def create_graph(checkpointer: BaseCheckpointSaver):
         if ctx.get("product_tag"):
             return {"contexto_tecnico": ctx}
 
-        tag = inferir_tag_por_mensaje(ultimo)
-        if tag:
-            ctx["product_tag"] = tag
-            logger.info(f"Producto detectado: tag={tag}")
-            ontologia = cargar_ontologia()
-            item = ontologia.get(tag, {})
-            tipo_producto = item.get("tipo", "unitario")
-            requisitos = get_requirements_by_tag(tag)
-            ctx["requisitos"] = requisitos
-            requires_diagnostic = get_requires_diagnostic(tag)
-            ctx["requiere_auditoria_electrica"] = requires_diagnostic
+        logger.info("=" * 80)
+        logger.info("[SELECTOR] 🚀 INICIANDO PROCESO DE SELECCIÓN DE PRODUCTOS")
+        logger.info(f"[SELECTOR] 📝 Consulta del usuario: '{ultimo}'")
+        logger.info("=" * 80)
 
-            if tipo_producto == "sistema":
-                tag_int = int(tag) if tag.isdigit() else 0
-                ongrid_tags = list(range(1, 11)) + [20, 35, 37, 38, 60, 61, 64, 79, 80, 81, 85]
-                offgrid_tags = [19, 50, 51, 52, 53, 56, 57, 58, 59, 62, 66, 69, 70, 71]
-                if tag_int in ongrid_tags:
-                    ctx["topologia"] = "On-Grid (Sistemas Atados a la Red)"
-                    ctx["tipo_producto"] = "sistema"
-                elif tag_int in offgrid_tags:
-                    ctx["topologia"] = "Off-Grid (Sistemas Aislados)"
-                    ctx["tipo_producto"] = "sistema"
+        # ================================================================
+        # NIVEL 1: Odoo Database (búsqueda flexible)
+        # ================================================================
+        logger.info("[SELECTOR] 📊 NIVEL 1: Intentando obtener producto desde Odoo DB (búsqueda flexible)")
+        odoo_results = []
+        try:
+            consulta_limpia = normalizar_consulta(ultimo)
+            logger.info(f"[SELECTOR] 📊 Consulta normalizada: '{consulta_limpia}'")
+            if not consulta_limpia:
+                consulta_limpia = ultimo
+            odoo_results = await odoo_db_client.search_products_flexible(consulta_limpia, limit=20)
+            if odoo_results:
+                logger.info(f"[SELECTOR] 📊 Odoo DB - {len(odoo_results)} candidatos encontrados")
+                textos_candidatos = []
+                for prod in odoo_results:
+                    texto = prod.get('name', '')
+                    if prod.get('description_sale'):
+                        texto += " " + prod['description_sale']
+                    textos_candidatos.append(texto)
+
+                puntajes = []
+                for idx, texto in enumerate(textos_candidatos):
+                    score = difflib.SequenceMatcher(None, consulta_limpia, texto).ratio() * 100
+                    puntajes.append((idx, score, odoo_results[idx]))
+                puntajes.sort(key=lambda x: x[1], reverse=True)
+                mejores = puntajes[:5]
+
+                for idx, score, prod in mejores:
+                    logger.info(f"[SELECTOR] 📊   {prod.get('name')} - Score: {score:.1f}%")
+
+                if mejores and mejores[0][1] >= 85 and (len(mejores) == 1 or (mejores[0][1] - mejores[1][1]) > 15):
+                    producto_elegido = mejores[0][2]
+                    ctx["product_tag"] = f"odoo_{producto_elegido['id']}"
+                    ctx["fuente_producto"] = "odoo"
+                    ctx["producto_odoo"] = producto_elegido
+                    ctx["odoo_search_results"] = [producto_elegido]
+                    ctx["tipo_producto"] = "unitario"
+                    ctx["requiere_auditoria_electrica"] = False
+                    ctx["requisitos"] = []
+                    ctx["precio_extraido"] = odoo_db_client.format_price(producto_elegido.get('list_price'))
+                    ctx["fuente_precio"] = "odoo_db"
+                    ctx["fuente_detalle"] = {
+                        "nivel": 1,
+                        "fuente": "odoo_db",
+                        "producto_id": producto_elegido.get('id'),
+                        "score": mejores[0][1],
+                        "precio_raw": producto_elegido.get('list_price')
+                    }
+                    if not ctx.get("checklist_universal"):
+                        ctx["checklist_universal"] = inicializar_checklist_universal(ctx)
+                    checklist = ctx["checklist_universal"]
+                    checklist["productos_interes"] = "completado"
+                    ctx["checklist_universal"] = checklist
+
+                    respuesta = f"✅ Encontramos el producto: **{producto_elegido['name']}** - Precio: {ctx['precio_extraido']}"
+                    logger.info(f"[SELECTOR] 📊 ✅ Coincidencia exacta: {respuesta}")
+                    logger.info("=" * 80)
+                    return {"messages": [AIMessage(content=respuesta)], "contexto_tecnico": ctx}
                 else:
-                    ctx["topologia"] = "Pendiente (sistema no clasificado)"
+                    opciones = []
+                    for i, (idx, score, prod) in enumerate(mejores, 1):
+                        precio = odoo_db_client.format_price(prod.get('list_price'))
+                        opciones.append(f"{i}. **{prod['name']}** - {precio}")
+                    respuesta = "🔍 Encontramos varios productos similares:\n\n" + "\n".join(opciones) + "\n\n¿Cuál de estos le interesa? (Indique el número)"
+                    ctx["productos_opciones"] = mejores
+                    ctx["esperando_seleccion"] = True
+                    logger.info("[SELECTOR] 📊 📋 Presentando opciones al usuario")
+                    logger.info("=" * 80)
+                    return {"messages": [AIMessage(content=respuesta)], "contexto_tecnico": ctx}
             else:
-                ctx["topologia"] = "No aplica (Producto unitario)"
-                ctx["tipo_producto"] = "unitario"
+                logger.warning("[SELECTOR] 📊 Odoo DB - ⚠️ No se encontraron productos coincidentes")
+                ctx["error_odoo_db"] = "No se encontraron productos coincidentes en Odoo DB"
+        except Exception as e:
+            logger.error(f"[SELECTOR] 📊 Odoo DB - ❌ Error inesperado: {e}")
+            ctx["error_odoo_db"] = str(e)
 
-            eval_data = {
-                "contexto": ctx,
-                "tipo_producto": ctx.get("tipo_producto"),
-                "product_tag": ctx.get("product_tag")
-            }
-            evaluacion = _supervisor.evaluate(eval_data)
-            if evaluacion["decision"] == "rewrite_context":
-                ctx.update(evaluacion.get("modified_context", {}))
-                logger.info(f"Supervisor aplicó regla {evaluacion['rule_id']} en selección de productos")
+        # ================================================================
+        # NIVEL 2: Web Scraping via Ontología + Price Extractor
+        # ================================================================
+        logger.info("[SELECTOR] 🌐 NIVEL 2: Intentando obtener producto desde Web Scraping (AISA Solar)")
+        try:
+            ontologia = cargar_ontologia()
+            tag = inferir_tag_por_mensaje(ultimo)
+            if tag and tag in ontologia:
+                item = ontologia[tag]
+                if "url" in item and item["url"]:
+                    logger.info(f"[SELECTOR] 🌐 Extrayendo precio desde: {item['url']}")
+                    precio_data = extract_price_from_url(item["url"])
+                    if precio_data:
+                        if precio_data["moneda"] == "USD":
+                            precio_gtq = precio_data["precio"] * 7.8
+                            simbolo = "Q"
+                        else:
+                            precio_gtq = precio_data["precio"]
+                            simbolo = precio_data.get("simbolo", "Q")
+                        ctx["product_tag"] = tag
+                        ctx["fuente_producto"] = "web_scraping"
+                        ctx["producto_web"] = item
+                        ctx["tipo_producto"] = item.get("tipo", "unitario")
+                        ctx["requisitos"] = item.get("requirements", [])
+                        ctx["requiere_auditoria_electrica"] = item.get("requiere_diagnostico_electrico", False)
+                        ctx["precio_extraido"] = f"{simbolo} {precio_gtq:,.2f}".replace(",", ".")
+                        ctx["moneda_extraida"] = "GTQ"
+                        ctx["fuente_precio"] = f"web_scraping:{item['url']}"
+                        ctx["fuente_detalle"] = {
+                            "nivel": 2,
+                            "fuente": "web_scraping",
+                            "url": item["url"],
+                            "precio_raw": precio_data["precio"],
+                            "moneda_raw": precio_data["moneda"],
+                            "selector": precio_data.get("selector"),
+                            "precio_convertido": precio_gtq
+                        }
+                        if not ctx.get("checklist_universal"):
+                            ctx["checklist_universal"] = inicializar_checklist_universal(ctx)
+                        checklist = ctx["checklist_universal"]
+                        checklist["productos_interes"] = "completado"
+                        ctx["checklist_universal"] = checklist
+                        logger.info("[SELECTOR] 🌐 ✅ Información guardada en contexto (fuente: Web Scraping)")
+                        logger.info("=" * 80)
+                        return {"contexto_tecnico": ctx}
+                    else:
+                        ctx["error_web_scraping"] = f"No se pudo extraer precio de {item['url']}"
+                else:
+                    ctx["error_web_scraping"] = "Producto sin URL en ontología"
+            else:
+                ctx["error_web_scraping"] = "Producto no encontrado en ontología"
+        except Exception as e:
+            logger.error(f"[SELECTOR] 🌐 ❌ Error en Web Scraping: {e}")
+            ctx["error_web_scraping"] = str(e)
 
-            if not ctx.get("checklist_universal"):
-                ctx["checklist_universal"] = inicializar_checklist_universal(ctx)
-            checklist = ctx["checklist_universal"]
-            if ctx.get("topologia") and "Pendiente" not in ctx["topologia"]:
-                checklist["topologia"] = "completado"
-            if ctx.get("tipo_producto"):
-                checklist["tipo_producto"] = "completado"
-            for req in requisitos:
-                field = req.get("field")
-                if field and ctx.get(field) is not None:
-                    checklist[field] = "completado"
-                elif field:
-                    checklist[field] = "pendiente"
-            ctx["checklist_universal"] = checklist
-            return {"contexto_tecnico": ctx}
+        # ================================================================
+        # NIVEL 3: Ontología Local (sin precio)
+        # ================================================================
+        logger.info("[SELECTOR] 📋 NIVEL 3: Intentando obtener producto desde Ontología Local")
+        try:
+            tag = inferir_tag_por_mensaje(ultimo)
+            if tag and tag in ontologia:
+                item = ontologia[tag]
+                ctx["product_tag"] = tag
+                ctx["fuente_producto"] = "ontologia"
+                ctx["producto_ontologia"] = item
+                ctx["tipo_producto"] = item.get("tipo", "unitario")
+                ctx["requisitos"] = get_requirements_by_tag(tag)
+                ctx["requiere_auditoria_electrica"] = get_requires_diagnostic(tag)
+                ctx["precio_extraido"] = "Precio bajo consulta"
+                ctx["moneda_extraida"] = "GTQ"
+                ctx["fuente_precio"] = "ontologia_local_sin_precio"
+                ctx["fuente_detalle"] = {
+                    "nivel": 3,
+                    "fuente": "ontologia_local",
+                    "producto_tag": tag,
+                    "tiene_precio": False
+                }
+                if not ctx.get("checklist_universal"):
+                    ctx["checklist_universal"] = inicializar_checklist_universal(ctx)
+                checklist = ctx["checklist_universal"]
+                checklist["productos_interes"] = "completado"
+                ctx["checklist_universal"] = checklist
+                logger.info("[SELECTOR] 📋 ✅ Información guardada en contexto (fuente: Ontología Local)")
+                logger.info("=" * 80)
+                return {"contexto_tecnico": ctx}
+            else:
+                ctx["error_ontologia"] = "Producto no encontrado en ontología"
+        except Exception as e:
+            logger.error(f"[SELECTOR] 📋 ❌ Error en Ontología Local: {e}")
+            ctx["error_ontologia"] = str(e)
 
-        pregunta = "¿Sobre qué tipo de equipo le gustaría recibir asesoría? (ej. paneles solares, calentadores, bombas de agua, iluminación...)"
-        new_messages = state.get("messages", []) + [AIMessage(content=pregunta)]
+        # ================================================================
+        # NIVEL 4: Derivación a Asesor (Último Recurso)
+        # ================================================================
+        logger.warning("[SELECTOR] 👤 NIVEL 4: Derivación a Asesor - Todos los niveles fallaron")
+        ctx["derivation_reason"] = {
+            "odoo_db": ctx.get("error_odoo_db", "No se intentó"),
+            "web_scraping": ctx.get("error_web_scraping", "No se intentó"),
+            "ontologia": ctx.get("error_ontologia", "No se intentó"),
+            "timestamp": str(datetime.now(timezone.utc)),
+            "consulta_usuario": ultimo
+        }
+        logger.info(f"[SELECTOR] 👤 Fallos: Odoo={ctx['derivation_reason']['odoo_db']}, Web={ctx['derivation_reason']['web_scraping']}, Ontología={ctx['derivation_reason']['ontologia']}")
+        ctx["escalation_mode"] = True
+        ctx["derivation_offered"] = True
+        ctx["micdp_offered"] = True
+
+        mensaje_derivacion = (
+            "Lamento informarle que no hemos podido obtener información del producto solicitado a través de nuestras fuentes de datos.\n\n"
+            "⚠️ He intentado obtener la información desde:\n"
+            "  1. Nuestra base de datos de productos (Odoo) - Sin éxito\n"
+            "  2. Nuestro catálogo web - Sin éxito\n"
+            "  3. Nuestro catálogo interno - Sin éxito\n\n"
+            "Para brindarle una atención personalizada y precisa, un asesor especializado de AISA Solar se comunicará con usted.\n\n"
+            "¿Autoriza que un asesor le contacte para ayudarle con su requerimiento?"
+        )
+
+        new_messages = state.get("messages", []) + [AIMessage(content=mensaje_derivacion)]
+        logger.info("[SELECTOR] 👤 ✅ Derivación a asesor activada.")
+        logger.info("=" * 80)
         return {"messages": new_messages, "contexto_tecnico": ctx}
 
     # -------------------------------------------------------------------------
-    # NODO 4: CÁLCULO DE CARGA OFF-GRID
+    # NODO 4: PROCESAR SELECCIÓN DE PRODUCTO (cuando el usuario elige una opción)
+    # -------------------------------------------------------------------------
+    @auditar_fase(nombre_fase="Procesar Selección de Producto", criticidad="MEDIA")
+    @observe_node(node_name="procesar_seleccion_producto")
+    async def procesar_seleccion_producto_node(state: AgentState):
+        ctx = dict(state.get("contexto_tecnico") or {})
+        ultimo = extraer_intencion_humana(state.get("messages", []))
+        opciones = ctx.get("productos_opciones", [])
+        if not opciones:
+            ctx["esperando_seleccion"] = False
+            return {"contexto_tecnico": ctx}
+
+        match = re.search(r'\b([1-5])\b', ultimo)
+        if match:
+            idx = int(match.group(1)) - 1
+            if 0 <= idx < len(opciones):
+                producto_elegido = opciones[idx][2]
+                ctx.pop("esperando_seleccion", None)
+                ctx.pop("productos_opciones", None)
+                ctx["product_tag"] = f"odoo_{producto_elegido['id']}"
+                ctx["fuente_producto"] = "odoo"
+                ctx["producto_odoo"] = producto_elegido
+                ctx["tipo_producto"] = "unitario"
+                ctx["requiere_auditoria_electrica"] = False
+                ctx["requisitos"] = []
+                ctx["precio_extraido"] = odoo_db_client.format_price(producto_elegido.get('list_price'))
+                ctx["fuente_precio"] = "odoo_db"
+                ctx["fuente_detalle"] = {
+                    "nivel": 1,
+                    "fuente": "odoo_db",
+                    "producto_id": producto_elegido.get('id'),
+                    "precio_raw": producto_elegido.get('list_price')
+                }
+                if not ctx.get("checklist_universal"):
+                    ctx["checklist_universal"] = inicializar_checklist_universal(ctx)
+                checklist = ctx["checklist_universal"]
+                checklist["productos_interes"] = "completado"
+                ctx["checklist_universal"] = checklist
+
+                respuesta = f"✅ Excelente elección. El producto **{producto_elegido['name']}** tiene un precio de {ctx['precio_extraido']}. ¿Necesita más información o desea cotizar?"
+                logger.info(f"[SELECTOR] 🎯 Usuario seleccionó opción {idx+1}: {producto_elegido['name']}")
+                return {"messages": [AIMessage(content=respuesta)], "contexto_tecnico": ctx}
+            else:
+                return {"messages": [AIMessage(content="⚠️ Número inválido. Por favor, indique un número del 1 al 5.")], "contexto_tecnico": ctx}
+        else:
+            consulta_norm = normalizar_consulta(ultimo)
+            if consulta_norm:
+                mejores = []
+                for idx, (orig_idx, score, prod) in enumerate(opciones):
+                    texto = prod.get('name', '')
+                    if prod.get('description_sale'):
+                        texto += " " + prod['description_sale']
+                    score = difflib.SequenceMatcher(None, consulta_norm, texto).ratio() * 100
+                    mejores.append((idx, score, prod))
+                mejores.sort(key=lambda x: x[1], reverse=True)
+                if mejores and mejores[0][1] >= 80:
+                    producto_elegido = mejores[0][2]
+                    ctx.pop("esperando_seleccion", None)
+                    ctx.pop("productos_opciones", None)
+                    ctx["product_tag"] = f"odoo_{producto_elegido['id']}"
+                    ctx["fuente_producto"] = "odoo"
+                    ctx["producto_odoo"] = producto_elegido
+                    ctx["tipo_producto"] = "unitario"
+                    ctx["requiere_auditoria_electrica"] = False
+                    ctx["requisitos"] = []
+                    ctx["precio_extraido"] = odoo_db_client.format_price(producto_elegido.get('list_price'))
+                    ctx["fuente_precio"] = "odoo_db"
+                    ctx["fuente_detalle"] = {
+                        "nivel": 1,
+                        "fuente": "odoo_db",
+                        "producto_id": producto_elegido.get('id'),
+                        "precio_raw": producto_elegido.get('list_price')
+                    }
+                    if not ctx.get("checklist_universal"):
+                        ctx["checklist_universal"] = inicializar_checklist_universal(ctx)
+                    checklist = ctx["checklist_universal"]
+                    checklist["productos_interes"] = "completado"
+                    ctx["checklist_universal"] = checklist
+
+                    respuesta = f"✅ Entendido, ha seleccionado **{producto_elegido['name']}** - Precio: {ctx['precio_extraido']}. ¿Necesita más información o desea cotizar?"
+                    return {"messages": [AIMessage(content=respuesta)], "contexto_tecnico": ctx}
+
+            return {"messages": [AIMessage(content="⚠️ No he entendido su selección. Por favor, indique el número de la opción que le interesa (1, 2, 3, 4 o 5).")], "contexto_tecnico": ctx}
+
+    # -------------------------------------------------------------------------
+    # NODO 5: CÁLCULO DE CARGA OFF-GRID
     # -------------------------------------------------------------------------
     @auditar_fase(nombre_fase="Cálculo de Carga Off‑Grid", criticidad="ALTA")
     @observe_node(node_name="calcular_carga_offgrid")
@@ -574,7 +849,7 @@ def create_graph(checkpointer: BaseCheckpointSaver):
         return {"contexto_tecnico": ctx}
 
     # -------------------------------------------------------------------------
-    # NODO 5: GENERAR RESPUESTA COMERCIAL (CON SUPERVISIÓN Y DETECCIÓN ACADÉMICA)
+    # NODO 6: GENERAR RESPUESTA COMERCIAL (CON SUPERVISIÓN Y DETECCIÓN ACADÉMICA)
     # -------------------------------------------------------------------------
     @auditar_fase(nombre_fase="Generación de Respuesta Comercial", criticidad="ALTA")
     @observe_node(node_name="generar_respuesta_comercial")
@@ -746,7 +1021,7 @@ def create_graph(checkpointer: BaseCheckpointSaver):
             return {"messages": [respuesta], "contexto_tecnico": ctx}
 
         # =========================================================================
-        # DE LO CONTRARIO, APLICAR SUPERVISIÓN (FLUJO NORMAL)
+        # APLICAR SUPERVISIÓN (FLUJO NORMAL)
         # =========================================================================
         eval_data = {
             "response": respuesta_final,
@@ -754,7 +1029,8 @@ def create_graph(checkpointer: BaseCheckpointSaver):
             "messages": state["messages"],
             "output_type": "response",
             "user_message": ultimo_mensaje,
-            "price_extractor_failed": False
+            "price_extractor_failed": False,
+            "fuente_producto": ctx.get("fuente_producto")
         }
         evaluacion = _supervisor.evaluate(eval_data)
 
@@ -799,7 +1075,7 @@ def create_graph(checkpointer: BaseCheckpointSaver):
         return {"messages": [respuesta], "contexto_tecnico": ctx}
 
     # -------------------------------------------------------------------------
-    # NODO 6: ACTUALIZAR CHECKLIST (CON TRUNCAMIENTO DE HISTORIAL)
+    # NODO 7: ACTUALIZAR CHECKLIST
     # -------------------------------------------------------------------------
     @auditar_fase(nombre_fase="Actualización Semántica de Checklist", criticidad="ALTA")
     @observe_node(node_name="actualizar_checklist")
@@ -926,7 +1202,7 @@ def create_graph(checkpointer: BaseCheckpointSaver):
         return {"contexto_tecnico": ctx}
 
     # -------------------------------------------------------------------------
-    # NODO 7: VERIFICAR CIERRE (SALTAR SI MICDP ACTIVO)
+    # NODO 8: VERIFICAR CIERRE
     # -------------------------------------------------------------------------
     @auditar_fase(nombre_fase="Verificación de Cierre Comercial", criticidad="ALTA")
     @observe_node(node_name="verificar_cierre")
@@ -988,7 +1264,7 @@ def create_graph(checkpointer: BaseCheckpointSaver):
         }
 
     # -------------------------------------------------------------------------
-    # NODO 8: ANEXAR CASO (NO APLICA DURANTE MICDP)
+    # NODO 9: ANEXAR CASO
     # -------------------------------------------------------------------------
     @observe_node(node_name="anexar_caso_respuesta")
     async def anexar_caso_respuesta_node(state: AgentState, config: RunnableConfig):
@@ -1001,9 +1277,9 @@ def create_graph(checkpointer: BaseCheckpointSaver):
                 messages[-1] = AIMessage(content=new_content, additional_kwargs=last_msg.additional_kwargs)
         return {"messages": messages}
 
-    # =========================================================================
-    # NUEVO NODO 9: EJECUTAR ENTREVISTA (MICDP) CON INICIALIZACIÓN LAZY Y RESTAURACIÓN DE COSTOS
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # NODO 10: EJECUTAR ENTREVISTA (MICDP)
+    # -------------------------------------------------------------------------
     @auditar_fase(nombre_fase="Ejecución de Entrevista MICDP", criticidad="ALTA")
     @observe_node(node_name="ejecutar_entrevista")
     async def ejecutar_entrevista_node(state: AgentState, config: RunnableConfig):
@@ -1011,7 +1287,6 @@ def create_graph(checkpointer: BaseCheckpointSaver):
         ultimo = extraer_intencion_humana(state.get("messages", []))
         thread_id = config.get("configurable", {}).get("thread_id", "unknown")
 
-        # Detectar si el usuario pide asesor durante el MICDP
         if ctx.get("micdp_active", False):
             asesor_keywords = ["asesor", "vendedor", "llamada", "hablar con", "contactar", "humano", "ayuda real"]
             if any(k in ultimo for k in asesor_keywords):
@@ -1021,12 +1296,10 @@ def create_graph(checkpointer: BaseCheckpointSaver):
                 respuesta = "Entendido, derivaré su solicitud a un asesor especializado de AISA Solar. En breve se pondrá en contacto con usted. ¡Que tenga un excelente día!"
                 return {"messages": [AIMessage(content=respuesta)], "contexto_tecnico": ctx}
 
-        # ===== INICIALIZACIÓN LAZY DEL ORQUESTADOR =====
         orquestador = await get_epistemology()
         if orquestador is None:
             return {"messages": [AIMessage(content="Error: orquestador no inicializado. Contacte a soporte.")]}
 
-        # Si no está activo, iniciar
         if not ctx.get("micdp_active", False):
             ctx["micdp_active"] = True
             ctx["micdp_accepted"] = False
@@ -1041,7 +1314,6 @@ def create_graph(checkpointer: BaseCheckpointSaver):
                 await orquestador.repo.update_state(thread_id, "IDENTIDAD", {"variables": {"nombre": nombre}})
             return {"messages": [AIMessage(content=welcome)], "contexto_tecnico": ctx}
 
-        # ===== LLAMADA AL ORQUESTADOR CON MANEJO DE NONE Y CAPTURA DE USAGE =====
         try:
             result = await orquestador.process_message(thread_id, ultimo)
         except Exception as e:
@@ -1058,7 +1330,6 @@ def create_graph(checkpointer: BaseCheckpointSaver):
         response = result.get("response", "Continuemos.")
         usage = result.get("usage", {})
 
-        # ===== CREAR AIMessage CON METADATA DE USAGE PARA LANGFUSE =====
         ai_message = AIMessage(content=response)
         if usage:
             ai_message.response_metadata = {
@@ -1075,44 +1346,35 @@ def create_graph(checkpointer: BaseCheckpointSaver):
 
         return {"messages": [ai_message], "contexto_tecnico": ctx}
 
-    # =========================================================================
-    # CONDICIÓN DE BORDE (con MICDP)
-    # =========================================================================
+    # -------------------------------------------------------------------------
+    # CONDICIÓN DE BORDE
+    # -------------------------------------------------------------------------
     def my_tools_condition(state: AgentState):
         messages = state.get("messages", [])
-        if messages and isinstance(messages[-1], AIMessage) and messages[-1].tool_calls:
-            return "tools"
         ctx = state.get("contexto_tecnico", {})
         ultimo = extraer_intencion_humana(messages)
 
         if ctx.get("micdp_active", False):
             return "ejecutar_entrevista"
-
-        micdp_keywords = [
-            "proceso conversacional", "definición de proyectos", "iniciar proyecto",
-            "quiero definir mi proyecto", "empezar definición", "MICDP",
-            "definir proyecto", "proceso de definición", "iniciar el proceso",
-            "necesito definir", "proyecto fotovoltaico", "definir mi necesidad"
-        ]
-        if any(k in ultimo for k in micdp_keywords):
-            ctx["micdp_accepted"] = True
+        if ctx.get("derivation_offered") and any(k in ultimo for k in ["sí", "si", "claro", "adelante"]):
             return "ejecutar_entrevista"
-
-        if ctx.get("derivation_offered") and any(k in ultimo for k in ["asesor", "llamada", "contactar", "hablar con"]):
+        if ctx.get("derivation_offered") and any(k in ultimo for k in ["asesor", "llamada", "contactar"]):
             return "actualizar_checklist"
 
-        if ctx.get("micdp_offered") and any(k in ultimo for k in ["sí", "si", "claro", "adelante", "iniciar"]):
-            ctx["micdp_accepted"] = True
-            return "ejecutar_entrevista"
+        if ctx.get("esperando_seleccion"):
+            return "procesar_seleccion_producto"
 
+        if messages and isinstance(messages[-1], AIMessage) and messages[-1].tool_calls:
+            return "tools"
         return "actualizar_checklist"
 
-    # =========================================================================
+    # -------------------------------------------------------------------------
     # ENSAMBLAJE DEL GRAFO
-    # =========================================================================
+    # -------------------------------------------------------------------------
     graph_builder.add_node("clasificar_intencion_comercial", clasificar_intencion_comercial_node)
     graph_builder.add_node("validar_ubicacion_cliente", validar_ubicacion_cliente_node)
     graph_builder.add_node("seleccionar_productos", seleccionar_productos_node)
+    graph_builder.add_node("procesar_seleccion_producto", procesar_seleccion_producto_node)
     graph_builder.add_node("calcular_carga_offgrid", calcular_carga_offgrid_node)
     graph_builder.add_node("generar_respuesta_comercial", generar_respuesta_comercial_node)
     graph_builder.add_node("actualizar_checklist", actualizar_checklist_node)
@@ -1131,6 +1393,8 @@ def create_graph(checkpointer: BaseCheckpointSaver):
     graph_builder.add_edge("actualizar_checklist", "verificar_cierre")
     graph_builder.add_edge("verificar_cierre", "anexar_caso_respuesta")
     graph_builder.add_edge("ejecutar_entrevista", END)
+
+    graph_builder.add_edge("procesar_seleccion_producto", "generar_respuesta_comercial")
 
     return graph_builder.compile(checkpointer=checkpointer)
 

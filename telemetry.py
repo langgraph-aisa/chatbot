@@ -62,13 +62,38 @@ def schedule_telemetry_event(*args: Any, **kwargs: Any):
 async def _get_pool():
     """Obtiene o crea un pool de conexiones a PostgreSQL (CTFOM)."""
     global _pool
+
     if _pool is None:
         db_url = os.getenv("CTFOM_DATABASE_URL")
+
         if not db_url:
             raise ValueError("CTFOM_DATABASE_URL no configurada")
+
         params = conninfo_to_dict(db_url)
-        params.pop('pool_size', None)
-        _pool = AsyncConnectionPool(conninfo=params, min_size=1, max_size=10, open=True)
+
+        # Eliminar parámetros que pertenecen al pool y no a PostgreSQL
+        for key in ("pool_size", "max_overflow", "pool_timeout"):
+            params.pop(key, None)
+
+        pool = AsyncConnectionPool(
+            conninfo="",
+            kwargs=params,
+            min_size=0,
+            max_size=10,
+            max_idle=300,
+            check=AsyncConnectionPool.check_connection,
+            open=False,
+        )
+
+        try:
+            await pool.open()
+            await pool.wait()
+        except Exception:
+            await pool.close()
+            raise
+
+        _pool = pool
+
     return _pool
 
 async def _batch_worker():
@@ -115,9 +140,21 @@ async def log_telemetry_event(trace_id: str, span_id: str, parent_span_id: str,
         log_telemetry_event._started = True
 
     event = (
-        trace_id, span_id, parent_span_id, thread_id, run_id,
-        layer, node_name, event_type, latency_ms, severity, error_code,
-        cpu_percent, memory_mb, dispatch_success, json.dumps(metadata or {})
+        trace_id or str(uuid.uuid4()),
+        span_id or str(uuid.uuid4()),
+        parent_span_id or None,
+        thread_id,
+        run_id,
+        layer,
+        node_name,
+        event_type,
+        latency_ms,
+        severity,
+        error_code,
+        cpu_percent,
+        memory_mb,
+        dispatch_success,
+        json.dumps(metadata or {}),
     )
     await _event_queue.put(event)
 

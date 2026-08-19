@@ -1,7 +1,7 @@
 """
 api_v2.py - Servidor FastAPI con trazabilidad Langfuse vía Ingestion API.
-VERSIÓN 2.1.6 – Corrección de inicialización del orquestador.
-31JUL2026.
+VERSIÓN 2.1.11 – Inicialización de Odoo y reseteo de flags de búsqueda.
+17AGO2026.
 """
 import os
 import asyncio
@@ -14,6 +14,9 @@ from collections import defaultdict
 from typing import AsyncGenerator, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from datetime import datetime, timezone
+
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 import psutil
 import asyncpg
@@ -47,6 +50,11 @@ from project_repository import ProjectRepository
 from epistemology import EpistemologyOrchestrator
 import openai
 
+# =============================================================================
+# IMPORTACIÓN DEL CLIENTE ODOO DB
+# =============================================================================
+from odoo_db_client import odoo_db_client
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -71,7 +79,7 @@ def get_observability_adapter() -> ObservabilityPort:
                 secret_key=LANGFUSE_SECRET_KEY,
                 host=LANGFUSE_HOST
             )
-            logger.info("Langfuse Ingestion adapter inicializado")
+            logger.info(f"Langfuse Ingestion adapter inicializado con host: {LANGFUSE_HOST}")
         except Exception as e:
             logger.critical(f"Error al inicializar adaptador Ingestion: {e}")
             _observability_adapter = NullObservabilityAdapter()
@@ -89,7 +97,7 @@ class NullObservabilityAdapter(ObservabilityPort):
     def flush(self):
         pass
 
-print("===== JARVI API v2.1.6 (CON SUPERVISOR Y MICDP) =====")
+print("===== JARVI API v2.1.11 (CON SUPERVISOR, MICDP Y ODOO DB) =====")
 
 # =============================================================================
 # SEGURIDAD (ISO/IEC 27001)
@@ -463,6 +471,8 @@ async def procesar_payload_n8n(chat_request: ChatRequest, http_request: Request)
     contexto = sesion.get("contexto_tecnico", {})
     contexto["nombre"] = nombre
     contexto["whatsapp"] = whatsapp
+    # Eliminar flag de intento de búsqueda para permitir nueva búsqueda
+    contexto.pop("catalog_search_attempted", None)
     sesion["contexto_tecnico"] = contexto
 
     # 8. Guardar sesión en Redis
@@ -543,7 +553,6 @@ async def procesar_payload_n8n(chat_request: ChatRequest, http_request: Request)
                 respuesta_final = evaluacion["modified_response"]
                 logger.info(f"Supervisor (api) reescribió respuesta: {evaluacion['rule_id']}")
         elif evaluacion["decision"] == "block":
-            # agent_graph ya debe haber manejado block con oferta, pero por si acaso:
             if "asesor" not in respuesta_final.lower():
                 respuesta_final = "Disculpe, esa información específica no está disponible en este momento. ¿Prefiere que un asesor de AISA Solar le contacte para brindarle una atención personalizada? o desea iniciar el **Proceso Conversacional para la Definición de Proyectos** (responda 'Sí' para iniciar el proceso, o 'Asesor' para contacto humano)"
                 ctx["derivation_offered"] = True
@@ -704,9 +713,25 @@ async def lifespan(app: FastAPI):
     get_observability_adapter()
 
     db_url = get_db_url()
-    print(f"DB URL (sanitizada): {db_url[:50]}...")
+    print("DB URL de checkpoints configurada")
     async with AsyncExitStack() as stack:
-        checkpointer = await stack.enter_async_context(AsyncPostgresSaver.from_conn_string(db_url))
+        checkpoint_pool = AsyncConnectionPool(
+            conninfo=db_url,
+            min_size=0,
+            max_size=10,
+            max_idle=300,
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": 0,
+                "row_factory": dict_row,
+            },
+            check=AsyncConnectionPool.check_connection,
+            open=False,
+        )
+
+        checkpoint_pool = await stack.enter_async_context(checkpoint_pool)
+
+        checkpointer = AsyncPostgresSaver(checkpoint_pool)
         await checkpointer.setup()
         graph = create_graph(checkpointer)
         print("JARVI 2.0 API inicializada – Grafo listo")
@@ -724,7 +749,6 @@ async def lifespan(app: FastAPI):
             ctfom_db_url = settings.ctfom_database_url
             if ctfom_db_url:
                 try:
-                    # Eliminar parámetros no soportados por asyncpg (pool_size, etc.)
                     parsed = urlparse(ctfom_db_url)
                     query = parse_qs(parsed.query)
                     for key in ["pool_size", "max_overflow", "pool_timeout"]:
@@ -754,6 +778,13 @@ async def lifespan(app: FastAPI):
             print(f"❌ Error crítico al inicializar orquestador: {e}")
             _epistemology = None
 
+        # ===== INICIALIZAR CLIENTE ODOO DB =====
+        try:
+            await odoo_db_client.connect()
+            print("✅ Cliente Odoo DB inicializado correctamente.")
+        except Exception as e:
+            print(f"❌ Error al inicializar cliente Odoo DB: {e}")
+
         start_batch_worker()
         yield
 
@@ -761,9 +792,10 @@ async def lifespan(app: FastAPI):
         await ctfom_pool.close()
     if redis_client:
         await redis_client.close()
+    await odoo_db_client.close()
     print("Apagando API JARVI")
 
-app = FastAPI(title="JARVI 2.0 API Central", version="2.1.6",
+app = FastAPI(title="JARVI 2.0 API Central", version="2.1.11",
               lifespan=lifespan, dependencies=[Depends(validar_api_key)])
 
 # =============================================================================
@@ -801,14 +833,16 @@ async def telemetry_middleware(request: Request, call_next):
 # =============================================================================
 @app.get("/health")
 async def health_check():
+    odoo_status = "connected" if odoo_db_client and odoo_db_client._initialized else "disconnected"
     status = {
         "service": "jarvi-backend-production",
-        "version": "2.1.6",
+        "version": "2.1.11",
         "redis": "connected" if redis_client else "disconnected",
         "graph": "ready" if graph else "unavailable",
         "langfuse": "Ingestion API adapter",
         "supervisor": "active",
         "micdp": "active" if _epistemology else "inactive",
+        "odoo_db": odoo_status,
         "status": "ok"
     }
     return status

@@ -1,7 +1,7 @@
 """
 supervisor_jarvi.py - Módulo de supervisión determinista para JARVI 2.0.
-VERSIÓN 2.3 – Si micdp_active es True, retorna allow sin evaluar reglas.
-31JUL2026
+VERSIÓN 2.4 – Si fuente_producto == "odoo", retorna allow sin evaluar reglas.
+14AGO2026.
 """
 
 import json
@@ -24,7 +24,14 @@ class SupervisorJarvi:
 
     def evaluate(self, data: Dict[str, Any]) -> Dict[str, Any]:
         # ================================================================
-        # NUEVO: Si MICDP está activo, permitir todo sin evaluar reglas
+        # NUEVO: Si la fuente del producto es Odoo, permitir todo sin evaluar reglas
+        # ================================================================
+        if data.get("fuente_producto") == "odoo":
+            logger.info("Producto verificado en Odoo, supervisor desactivado.")
+            return {"decision": "allow", "rule_id": "ODOO-ALLOW", "message": "Fuente verificada"}
+
+        # ================================================================
+        # Si MICDP está activo, permitir todo sin evaluar reglas
         # ================================================================
         if data.get("contexto", {}).get("micdp_active", False):
             logger.info("MICDP activo: supervisor retorna allow sin evaluar reglas.")
@@ -175,6 +182,10 @@ class SupervisorJarvi:
                     return False
             elif key == "micdp_active":
                 if data.get("micdp_active") != value:
+                    return False
+            # NUEVO: condición para fuente_producto (aunque ya la saltamos antes, por si acaso)
+            elif key == "fuente_producto":
+                if data.get("fuente_producto") != value:
                     return False
         return True
 
